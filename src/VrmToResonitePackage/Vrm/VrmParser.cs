@@ -1,0 +1,637 @@
+using System.Text.Json;
+using Vec3 = System.Numerics.Vector3;
+using Vec4 = System.Numerics.Vector4;
+
+namespace VrmToResonitePackage.Vrm;
+
+/// <summary>
+/// Reads the JSON chunk of a VRM (GLB container) file and extracts the VRM-specific data.
+/// Supports both VRM 0.x ("VRM" extension) and VRM 1.0 ("VRMC_vrm" extension).
+/// </summary>
+public static class VrmParser
+{
+    public static VrmModel Parse(string vrmPath)
+    {
+        using FileStream stream = File.OpenRead(vrmPath);
+        using JsonDocument doc = JsonDocument.Parse(ReadGlbJsonChunk(stream));
+        JsonElement root = doc.RootElement;
+
+        var model = new VrmModel();
+        ParseGltfCommon(root, model);
+
+        if (root.TryGetProperty("extensions", out JsonElement extensions))
+        {
+            if (extensions.TryGetProperty("VRMC_vrm", out JsonElement vrm1))
+            {
+                model.SpecVersionMajor = 1;
+                ParseVrm1(extensions, vrm1, root, model);
+                return model;
+            }
+            if (extensions.TryGetProperty("VRM", out JsonElement vrm0))
+            {
+                model.SpecVersionMajor = 0;
+                ParseVrm0(vrm0, model);
+                return model;
+            }
+        }
+        throw new InvalidDataException("VRM拡張が見つかりません。VRM 0.x / 1.0 のファイルか確認してください。");
+    }
+
+    private static byte[] ReadGlbJsonChunk(Stream stream)
+    {
+        using var reader = new BinaryReader(stream, System.Text.Encoding.UTF8, leaveOpen: true);
+        uint magic = reader.ReadUInt32();
+        if (magic != 0x46546C67) // "glTF"
+        {
+            throw new InvalidDataException("GLBファイルではありません（マジックナンバー不一致）。");
+        }
+        reader.ReadUInt32(); // container version
+        reader.ReadUInt32(); // total length
+        while (stream.Position < stream.Length)
+        {
+            uint chunkLength = reader.ReadUInt32();
+            uint chunkType = reader.ReadUInt32();
+            if (chunkType == 0x4E4F534A) // "JSON"
+            {
+                return reader.ReadBytes(checked((int)chunkLength));
+            }
+            stream.Seek(chunkLength, SeekOrigin.Current);
+        }
+        throw new InvalidDataException("GLBのJSONチャンクが見つかりません。");
+    }
+
+    private static void ParseGltfCommon(JsonElement root, VrmModel model)
+    {
+        if (root.TryGetProperty("nodes", out JsonElement nodes))
+        {
+            int index = 0;
+            foreach (JsonElement node in nodes.EnumerateArray())
+            {
+                string name = node.TryGetProperty("name", out JsonElement n) ? n.GetString() : null;
+                model.NodeNames.Add(name ?? $"node_{index}");
+                int meshIndex = node.TryGetProperty("mesh", out JsonElement m) ? m.GetInt32() : -1;
+                model.NodeMeshIndices.Add(meshIndex);
+                if (meshIndex >= 0)
+                {
+                    if (!model.MeshToNodes.TryGetValue(meshIndex, out List<int> list))
+                    {
+                        list = new List<int>();
+                        model.MeshToNodes[meshIndex] = list;
+                    }
+                    list.Add(index);
+                }
+                index++;
+            }
+        }
+
+        if (root.TryGetProperty("meshes", out JsonElement meshes))
+        {
+            foreach (JsonElement mesh in meshes.EnumerateArray())
+            {
+                model.MeshTargetNames.Add(ExtractTargetNames(mesh));
+            }
+        }
+
+        // Base glTF material info (alpha mode etc.) — applies to both VRM versions.
+        if (root.TryGetProperty("materials", out JsonElement materials))
+        {
+            int matIndex = 0;
+            foreach (JsonElement mat in materials.EnumerateArray())
+            {
+                string name = mat.TryGetProperty("name", out JsonElement n) ? n.GetString() : $"material_{matIndex}";
+                var info = new VrmMaterialInfo { Name = name };
+                if (mat.TryGetProperty("alphaMode", out JsonElement alphaMode))
+                {
+                    info.AlphaMode = alphaMode.GetString()?.ToLowerInvariant() ?? "opaque";
+                }
+                if (mat.TryGetProperty("alphaCutoff", out JsonElement cutoff))
+                {
+                    info.AlphaCutoff = cutoff.GetSingle();
+                }
+                if (mat.TryGetProperty("doubleSided", out JsonElement doubleSided))
+                {
+                    info.DoubleSided = doubleSided.GetBoolean();
+                }
+                if (mat.TryGetProperty("emissiveFactor", out JsonElement emissive))
+                {
+                    Vec3 e = ReadVec3Array(emissive);
+                    info.EmissionColor = new Vec4(e.X, e.Y, e.Z, 1f);
+                }
+                if (mat.TryGetProperty("extensions", out JsonElement matExt) &&
+                    matExt.TryGetProperty("VRMC_materials_mtoon", out JsonElement mtoon))
+                {
+                    info.IsMToon = true;
+                    if (mtoon.TryGetProperty("shadeColorFactor", out JsonElement shade))
+                    {
+                        Vec3 s = ReadVec3Array(shade);
+                        info.ShadeColor = new Vec4(s.X, s.Y, s.Z, 1f);
+                    }
+                    if (mtoon.TryGetProperty("outlineWidthFactor", out JsonElement ow))
+                    {
+                        info.OutlineWidth = ow.GetSingle();
+                    }
+                    if (mtoon.TryGetProperty("outlineColorFactor", out JsonElement oc))
+                    {
+                        Vec3 o = ReadVec3Array(oc);
+                        info.OutlineColor = new Vec4(o.X, o.Y, o.Z, 1f);
+                    }
+                    if (mtoon.TryGetProperty("outlineWidthMode", out JsonElement owm) &&
+                        owm.GetString() == "none")
+                    {
+                        info.OutlineWidth = 0f;
+                    }
+                }
+                model.Materials[name] = info;
+                matIndex++;
+            }
+        }
+    }
+
+    private static List<string> ExtractTargetNames(JsonElement mesh)
+    {
+        // UniVRM convention: mesh.extras.targetNames, or per-primitive extras.targetNames.
+        if (mesh.TryGetProperty("extras", out JsonElement extras) &&
+            extras.TryGetProperty("targetNames", out JsonElement names))
+        {
+            return names.EnumerateArray().Select(e => e.GetString() ?? "").ToList();
+        }
+        if (mesh.TryGetProperty("primitives", out JsonElement primitives))
+        {
+            foreach (JsonElement primitive in primitives.EnumerateArray())
+            {
+                if (primitive.TryGetProperty("extras", out JsonElement pExtras) &&
+                    pExtras.TryGetProperty("targetNames", out JsonElement pNames))
+                {
+                    return pNames.EnumerateArray().Select(e => e.GetString() ?? "").ToList();
+                }
+            }
+        }
+        return new List<string>();
+    }
+
+    // ---------------------------------------------------------------- VRM 0.x
+
+    private static void ParseVrm0(JsonElement vrm, VrmModel model)
+    {
+        if (vrm.TryGetProperty("meta", out JsonElement meta))
+        {
+            model.Title = GetString(meta, "title");
+            model.Author = GetString(meta, "author");
+        }
+
+        if (vrm.TryGetProperty("humanoid", out JsonElement humanoid) &&
+            humanoid.TryGetProperty("humanBones", out JsonElement humanBones))
+        {
+            foreach (JsonElement entry in humanBones.EnumerateArray())
+            {
+                string bone = GetString(entry, "bone");
+                if (bone != null && entry.TryGetProperty("node", out JsonElement node))
+                {
+                    model.HumanBones[NormalizeVrm0BoneName(bone)] = node.GetInt32();
+                }
+            }
+        }
+
+        if (vrm.TryGetProperty("firstPerson", out JsonElement firstPerson) &&
+            firstPerson.TryGetProperty("firstPersonBoneOffset", out JsonElement fpOffset))
+        {
+            model.FirstPersonOffset = ReadVec3Object(fpOffset);
+        }
+
+        if (vrm.TryGetProperty("blendShapeMaster", out JsonElement master) &&
+            master.TryGetProperty("blendShapeGroups", out JsonElement groups))
+        {
+            foreach (JsonElement group in groups.EnumerateArray())
+            {
+                var expression = new VrmExpression
+                {
+                    Name = GetString(group, "name"),
+                    Preset = NormalizeVrm0Preset(GetString(group, "presetName"), GetString(group, "name")),
+                    IsBinary = group.TryGetProperty("isBinary", out JsonElement binary) && binary.GetBoolean(),
+                };
+                if (group.TryGetProperty("binds", out JsonElement binds))
+                {
+                    foreach (JsonElement bind in binds.EnumerateArray())
+                    {
+                        if (!bind.TryGetProperty("mesh", out JsonElement meshEl) ||
+                            !bind.TryGetProperty("index", out JsonElement indexEl))
+                        {
+                            continue;
+                        }
+                        float weight = bind.TryGetProperty("weight", out JsonElement w) ? w.GetSingle() : 100f;
+                        expression.Binds.Add(new VrmExpressionBind
+                        {
+                            MeshIndex = meshEl.GetInt32(),
+                            MorphIndex = indexEl.GetInt32(),
+                            Weight = weight / 100f,
+                        });
+                    }
+                }
+                model.Expressions.Add(expression);
+            }
+        }
+
+        if (vrm.TryGetProperty("secondaryAnimation", out JsonElement secondary))
+        {
+            // Flatten collider groups: group index -> list of model.SpringColliders indices.
+            var groupToColliders = new List<List<int>>();
+            if (secondary.TryGetProperty("colliderGroups", out JsonElement colliderGroups))
+            {
+                foreach (JsonElement colliderGroup in colliderGroups.EnumerateArray())
+                {
+                    var indices = new List<int>();
+                    int nodeIndex = colliderGroup.TryGetProperty("node", out JsonElement node) ? node.GetInt32() : -1;
+                    if (colliderGroup.TryGetProperty("colliders", out JsonElement colliders))
+                    {
+                        foreach (JsonElement collider in colliders.EnumerateArray())
+                        {
+                            indices.Add(model.SpringColliders.Count);
+                            model.SpringColliders.Add(new VrmSpringCollider
+                            {
+                                NodeIndex = nodeIndex,
+                                Offset = collider.TryGetProperty("offset", out JsonElement off)
+                                    ? ReadVec3Object(off) : Vec3.Zero,
+                                Radius = collider.TryGetProperty("radius", out JsonElement r) ? r.GetSingle() : 0f,
+                            });
+                        }
+                    }
+                    groupToColliders.Add(indices);
+                }
+            }
+
+            if (secondary.TryGetProperty("boneGroups", out JsonElement boneGroups))
+            {
+                foreach (JsonElement boneGroup in boneGroups.EnumerateArray())
+                {
+                    var chain = new VrmSpringChain
+                    {
+                        Name = GetString(boneGroup, "comment"),
+                        // Note: the VRM 0.x spec really does spell it "stiffiness".
+                        Stiffness = boneGroup.TryGetProperty("stiffiness", out JsonElement st) ? st.GetSingle() : 1f,
+                        GravityPower = boneGroup.TryGetProperty("gravityPower", out JsonElement gp) ? gp.GetSingle() : 0f,
+                        GravityDir = boneGroup.TryGetProperty("gravityDir", out JsonElement gd)
+                            ? ReadVec3Object(gd) : new Vec3(0f, -1f, 0f),
+                        DragForce = boneGroup.TryGetProperty("dragForce", out JsonElement df) ? df.GetSingle() : 0.4f,
+                        HitRadius = boneGroup.TryGetProperty("hitRadius", out JsonElement hr) ? hr.GetSingle() : 0.02f,
+                    };
+                    if (boneGroup.TryGetProperty("bones", out JsonElement bones))
+                    {
+                        foreach (JsonElement bone in bones.EnumerateArray())
+                        {
+                            chain.RootNodes.Add(bone.GetInt32());
+                        }
+                    }
+                    if (boneGroup.TryGetProperty("colliderGroups", out JsonElement cg))
+                    {
+                        foreach (JsonElement groupIndex in cg.EnumerateArray())
+                        {
+                            int gi = groupIndex.GetInt32();
+                            if (gi >= 0 && gi < groupToColliders.Count)
+                            {
+                                chain.ColliderIndices.AddRange(groupToColliders[gi]);
+                            }
+                        }
+                    }
+                    if (chain.RootNodes.Count > 0)
+                    {
+                        model.SpringChains.Add(chain);
+                    }
+                }
+            }
+        }
+
+        // VRM0 material properties override the base glTF info (MToon lives here).
+        if (vrm.TryGetProperty("materialProperties", out JsonElement materialProperties))
+        {
+            foreach (JsonElement mat in materialProperties.EnumerateArray())
+            {
+                string name = GetString(mat, "name");
+                if (name == null)
+                {
+                    continue;
+                }
+                if (!model.Materials.TryGetValue(name, out VrmMaterialInfo info))
+                {
+                    info = new VrmMaterialInfo { Name = name };
+                    model.Materials[name] = info;
+                }
+                string shader = GetString(mat, "shader") ?? "";
+                info.IsMToon = shader.Contains("MToon", StringComparison.OrdinalIgnoreCase);
+
+                if (mat.TryGetProperty("keywordMap", out JsonElement keywords))
+                {
+                    if (keywords.TryGetProperty("_ALPHABLEND_ON", out JsonElement ab) && ab.GetBoolean())
+                    {
+                        info.AlphaMode = "blend";
+                    }
+                    else if (keywords.TryGetProperty("_ALPHATEST_ON", out JsonElement at) && at.GetBoolean())
+                    {
+                        info.AlphaMode = "mask";
+                    }
+                }
+                if (mat.TryGetProperty("floatProperties", out JsonElement floats))
+                {
+                    if (floats.TryGetProperty("_Cutoff", out JsonElement cutoff))
+                    {
+                        info.AlphaCutoff = cutoff.GetSingle();
+                    }
+                    if (floats.TryGetProperty("_OutlineWidth", out JsonElement ow))
+                    {
+                        // MToon 0.x outline width is in centimeters-ish (0..0.1 typical), keep raw.
+                        info.OutlineWidth = ow.GetSingle();
+                    }
+                    if (floats.TryGetProperty("_OutlineWidthMode", out JsonElement owm) &&
+                        (int)owm.GetSingle() == 0)
+                    {
+                        info.OutlineWidth = 0f;
+                    }
+                    if (floats.TryGetProperty("_CullMode", out JsonElement cull))
+                    {
+                        // 0 = off (double sided), 1 = front, 2 = back.
+                        info.DoubleSided = (int)cull.GetSingle() == 0;
+                    }
+                }
+                if (mat.TryGetProperty("vectorProperties", out JsonElement vectors))
+                {
+                    if (vectors.TryGetProperty("_ShadeColor", out JsonElement shade))
+                    {
+                        info.ShadeColor = ReadVec4Array(shade);
+                    }
+                    if (vectors.TryGetProperty("_OutlineColor", out JsonElement outline))
+                    {
+                        info.OutlineColor = ReadVec4Array(outline);
+                    }
+                    if (vectors.TryGetProperty("_EmissionColor", out JsonElement emission))
+                    {
+                        info.EmissionColor = ReadVec4Array(emission);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>VRM0 bone names are already camelCase like VRM1, except the thumb chain.</summary>
+    private static string NormalizeVrm0BoneName(string bone)
+    {
+        return bone switch
+        {
+            "leftThumbProximal" => "leftThumbMetacarpal",
+            "leftThumbIntermediate" => "leftThumbProximal",
+            "rightThumbProximal" => "rightThumbMetacarpal",
+            "rightThumbIntermediate" => "rightThumbProximal",
+            _ => bone,
+        };
+    }
+
+    private static string NormalizeVrm0Preset(string preset, string fallbackName)
+    {
+        return preset switch
+        {
+            "a" => "aa",
+            "i" => "ih",
+            "u" => "ou",
+            "e" => "ee",
+            "o" => "oh",
+            "blink" => "blink",
+            "blink_l" => "blinkLeft",
+            "blink_r" => "blinkRight",
+            "joy" => "happy",
+            "angry" => "angry",
+            "sorrow" => "sad",
+            "fun" => "relaxed",
+            "neutral" => "neutral",
+            "lookup" => "lookUp",
+            "lookdown" => "lookDown",
+            "lookleft" => "lookLeft",
+            "lookright" => "lookRight",
+            _ => fallbackName ?? preset,
+        };
+    }
+
+    // ---------------------------------------------------------------- VRM 1.0
+
+    private static void ParseVrm1(JsonElement extensions, JsonElement vrm, JsonElement gltfRoot, VrmModel model)
+    {
+        if (vrm.TryGetProperty("meta", out JsonElement meta))
+        {
+            model.Title = GetString(meta, "name");
+            if (meta.TryGetProperty("authors", out JsonElement authors) &&
+                authors.ValueKind == JsonValueKind.Array)
+            {
+                model.Author = string.Join(", ", authors.EnumerateArray().Select(a => a.GetString()));
+            }
+        }
+
+        if (vrm.TryGetProperty("humanoid", out JsonElement humanoid) &&
+            humanoid.TryGetProperty("humanBones", out JsonElement humanBones))
+        {
+            foreach (JsonProperty bone in humanBones.EnumerateObject())
+            {
+                if (bone.Value.TryGetProperty("node", out JsonElement node))
+                {
+                    model.HumanBones[bone.Name] = node.GetInt32();
+                }
+            }
+        }
+
+        if (vrm.TryGetProperty("lookAt", out JsonElement lookAt) &&
+            lookAt.TryGetProperty("offsetFromHeadBone", out JsonElement offset))
+        {
+            model.FirstPersonOffset = ReadVec3Array(offset);
+        }
+
+        if (vrm.TryGetProperty("expressions", out JsonElement expressions))
+        {
+            if (expressions.TryGetProperty("preset", out JsonElement preset))
+            {
+                foreach (JsonProperty entry in preset.EnumerateObject())
+                {
+                    ParseVrm1Expression(entry.Name, entry.Name, entry.Value, model);
+                }
+            }
+            if (expressions.TryGetProperty("custom", out JsonElement custom))
+            {
+                foreach (JsonProperty entry in custom.EnumerateObject())
+                {
+                    ParseVrm1Expression(entry.Name, entry.Name, entry.Value, model);
+                }
+            }
+        }
+
+        if (extensions.TryGetProperty("VRMC_springBone", out JsonElement springBone))
+        {
+            ParseVrm1SpringBones(springBone, model);
+        }
+    }
+
+    private static void ParseVrm1Expression(string preset, string name, JsonElement expression, VrmModel model)
+    {
+        var result = new VrmExpression
+        {
+            Preset = preset,
+            Name = name,
+            IsBinary = expression.TryGetProperty("isBinary", out JsonElement binary) && binary.GetBoolean(),
+        };
+        if (expression.TryGetProperty("morphTargetBinds", out JsonElement binds))
+        {
+            foreach (JsonElement bind in binds.EnumerateArray())
+            {
+                if (!bind.TryGetProperty("node", out JsonElement nodeEl) ||
+                    !bind.TryGetProperty("index", out JsonElement indexEl))
+                {
+                    continue;
+                }
+                int nodeIndex = nodeEl.GetInt32();
+                int meshIndex = nodeIndex >= 0 && nodeIndex < model.NodeMeshIndices.Count
+                    ? model.NodeMeshIndices[nodeIndex] : -1;
+                if (meshIndex < 0)
+                {
+                    continue;
+                }
+                result.Binds.Add(new VrmExpressionBind
+                {
+                    MeshIndex = meshIndex,
+                    MorphIndex = indexEl.GetInt32(),
+                    Weight = bind.TryGetProperty("weight", out JsonElement w) ? w.GetSingle() : 1f,
+                });
+            }
+        }
+        model.Expressions.Add(result);
+    }
+
+    private static void ParseVrm1SpringBones(JsonElement springBone, VrmModel model)
+    {
+        if (springBone.TryGetProperty("colliders", out JsonElement colliders))
+        {
+            foreach (JsonElement collider in colliders.EnumerateArray())
+            {
+                var result = new VrmSpringCollider
+                {
+                    NodeIndex = collider.TryGetProperty("node", out JsonElement node) ? node.GetInt32() : -1,
+                };
+                if (collider.TryGetProperty("shape", out JsonElement shape))
+                {
+                    if (shape.TryGetProperty("sphere", out JsonElement sphere))
+                    {
+                        result.Offset = sphere.TryGetProperty("offset", out JsonElement so)
+                            ? ReadVec3Array(so) : Vec3.Zero;
+                        result.Radius = sphere.TryGetProperty("radius", out JsonElement sr) ? sr.GetSingle() : 0f;
+                    }
+                    else if (shape.TryGetProperty("capsule", out JsonElement capsule))
+                    {
+                        result.Offset = capsule.TryGetProperty("offset", out JsonElement co)
+                            ? ReadVec3Array(co) : Vec3.Zero;
+                        result.Radius = capsule.TryGetProperty("radius", out JsonElement cr) ? cr.GetSingle() : 0f;
+                        result.Tail = capsule.TryGetProperty("tail", out JsonElement tail)
+                            ? ReadVec3Array(tail) : null;
+                    }
+                }
+                model.SpringColliders.Add(result);
+            }
+        }
+
+        var groupToColliders = new List<List<int>>();
+        if (springBone.TryGetProperty("colliderGroups", out JsonElement colliderGroups))
+        {
+            foreach (JsonElement group in colliderGroups.EnumerateArray())
+            {
+                var indices = new List<int>();
+                if (group.TryGetProperty("colliders", out JsonElement groupColliders))
+                {
+                    indices.AddRange(groupColliders.EnumerateArray().Select(c => c.GetInt32()));
+                }
+                groupToColliders.Add(indices);
+            }
+        }
+
+        if (!springBone.TryGetProperty("springs", out JsonElement springs))
+        {
+            return;
+        }
+        foreach (JsonElement spring in springs.EnumerateArray())
+        {
+            var chain = new VrmSpringChain { Name = GetString(spring, "name") };
+            float stiffnessSum = 0f, gravitySum = 0f, dragSum = 0f, radiusSum = 0f;
+            Vec3 gravityDir = new(0f, -1f, 0f);
+            int jointCount = 0;
+            if (spring.TryGetProperty("joints", out JsonElement joints))
+            {
+                foreach (JsonElement joint in joints.EnumerateArray())
+                {
+                    if (joint.TryGetProperty("node", out JsonElement node))
+                    {
+                        chain.JointNodes.Add(node.GetInt32());
+                    }
+                    stiffnessSum += joint.TryGetProperty("stiffness", out JsonElement st) ? st.GetSingle() : 1f;
+                    gravitySum += joint.TryGetProperty("gravityPower", out JsonElement gp) ? gp.GetSingle() : 0f;
+                    dragSum += joint.TryGetProperty("dragForce", out JsonElement df) ? df.GetSingle() : 0.4f;
+                    radiusSum += joint.TryGetProperty("hitRadius", out JsonElement hr) ? hr.GetSingle() : 0.02f;
+                    if (joint.TryGetProperty("gravityDir", out JsonElement gd))
+                    {
+                        gravityDir = ReadVec3Array(gd);
+                    }
+                    jointCount++;
+                }
+            }
+            if (jointCount == 0)
+            {
+                continue;
+            }
+            chain.Stiffness = stiffnessSum / jointCount;
+            chain.GravityPower = gravitySum / jointCount;
+            chain.DragForce = dragSum / jointCount;
+            chain.HitRadius = radiusSum / jointCount;
+            chain.GravityDir = gravityDir;
+            chain.RootNodes.Add(chain.JointNodes[0]);
+            if (spring.TryGetProperty("colliderGroups", out JsonElement springGroups))
+            {
+                foreach (JsonElement groupIndex in springGroups.EnumerateArray())
+                {
+                    int gi = groupIndex.GetInt32();
+                    if (gi >= 0 && gi < groupToColliders.Count)
+                    {
+                        chain.ColliderIndices.AddRange(groupToColliders[gi]);
+                    }
+                }
+            }
+            model.SpringChains.Add(chain);
+        }
+    }
+
+    // ---------------------------------------------------------------- helpers
+
+    private static string GetString(JsonElement element, string property)
+    {
+        return element.TryGetProperty(property, out JsonElement value) &&
+               value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
+    private static Vec3 ReadVec3Object(JsonElement element)
+    {
+        float x = element.TryGetProperty("x", out JsonElement xe) ? xe.GetSingle() : 0f;
+        float y = element.TryGetProperty("y", out JsonElement ye) ? ye.GetSingle() : 0f;
+        float z = element.TryGetProperty("z", out JsonElement ze) ? ze.GetSingle() : 0f;
+        return new Vec3(x, y, z);
+    }
+
+    private static Vec3 ReadVec3Array(JsonElement element)
+    {
+        float[] values = element.EnumerateArray().Take(3).Select(e => e.GetSingle()).ToArray();
+        return new Vec3(
+            values.Length > 0 ? values[0] : 0f,
+            values.Length > 1 ? values[1] : 0f,
+            values.Length > 2 ? values[2] : 0f);
+    }
+
+    private static Vec4 ReadVec4Array(JsonElement element)
+    {
+        float[] values = element.EnumerateArray().Take(4).Select(e => e.GetSingle()).ToArray();
+        return new Vec4(
+            values.Length > 0 ? values[0] : 0f,
+            values.Length > 1 ? values[1] : 0f,
+            values.Length > 2 ? values[2] : 0f,
+            values.Length > 3 ? values[3] : 1f);
+    }
+}

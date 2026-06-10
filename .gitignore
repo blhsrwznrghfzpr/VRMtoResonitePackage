@@ -1,0 +1,18 @@
+# Build outputs
+bin/
+obj/
+publish/
+
+# Test artifacts
+test-output/
+*.resonitepackage
+
+# User-local settings
+*.user
+resonite-path.txt
+.vs/
+.idea/
+.claude/settings.local.json
+
+# Logs
+*.log

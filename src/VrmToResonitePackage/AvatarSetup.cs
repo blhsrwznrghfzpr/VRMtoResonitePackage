@@ -1,0 +1,702 @@
+using Elements.Core;
+using FrooxEngine;
+using FrooxEngine.CommonAvatar;
+using FrooxEngine.FinalIK;
+using Renderite.Shared;
+using VrmToResonitePackage.Vrm;
+
+namespace VrmToResonitePackage;
+
+/// <summary>
+/// Headless replication of Resonite's in-game avatar creation (AvatarCreator.RunCreate),
+/// driven by the exact humanoid/expression data from the VRM file instead of in-world
+/// user alignment and name heuristics.
+/// </summary>
+internal static class AvatarSetup
+{
+    private static readonly Dictionary<string, BodyNode> VrmBoneToBodyNode = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["hips"] = BodyNode.Hips,
+        ["spine"] = BodyNode.Spine,
+        ["chest"] = BodyNode.Chest,
+        ["upperChest"] = BodyNode.UpperChest,
+        ["neck"] = BodyNode.Neck,
+        ["head"] = BodyNode.Head,
+        ["jaw"] = BodyNode.Jaw,
+        ["leftEye"] = BodyNode.LeftEye,
+        ["rightEye"] = BodyNode.RightEye,
+        ["leftShoulder"] = BodyNode.LeftShoulder,
+        ["leftUpperArm"] = BodyNode.LeftUpperArm,
+        ["leftLowerArm"] = BodyNode.LeftLowerArm,
+        ["leftHand"] = BodyNode.LeftHand,
+        ["rightShoulder"] = BodyNode.RightShoulder,
+        ["rightUpperArm"] = BodyNode.RightUpperArm,
+        ["rightLowerArm"] = BodyNode.RightLowerArm,
+        ["rightHand"] = BodyNode.RightHand,
+        ["leftUpperLeg"] = BodyNode.LeftUpperLeg,
+        ["leftLowerLeg"] = BodyNode.LeftLowerLeg,
+        ["leftFoot"] = BodyNode.LeftFoot,
+        ["leftToes"] = BodyNode.LeftToes,
+        ["rightUpperLeg"] = BodyNode.RightUpperLeg,
+        ["rightLowerLeg"] = BodyNode.RightLowerLeg,
+        ["rightFoot"] = BodyNode.RightFoot,
+        ["rightToes"] = BodyNode.RightToes,
+        // Thumbs (parser already normalizes VRM0 thumb names to the VRM1 scheme).
+        ["leftThumbMetacarpal"] = BodyNode.LeftThumb_Metacarpal,
+        ["leftThumbProximal"] = BodyNode.LeftThumb_Proximal,
+        ["leftThumbDistal"] = BodyNode.LeftThumb_Distal,
+        ["rightThumbMetacarpal"] = BodyNode.RightThumb_Metacarpal,
+        ["rightThumbProximal"] = BodyNode.RightThumb_Proximal,
+        ["rightThumbDistal"] = BodyNode.RightThumb_Distal,
+        ["leftIndexProximal"] = BodyNode.LeftIndexFinger_Proximal,
+        ["leftIndexIntermediate"] = BodyNode.LeftIndexFinger_Intermediate,
+        ["leftIndexDistal"] = BodyNode.LeftIndexFinger_Distal,
+        ["leftMiddleProximal"] = BodyNode.LeftMiddleFinger_Proximal,
+        ["leftMiddleIntermediate"] = BodyNode.LeftMiddleFinger_Intermediate,
+        ["leftMiddleDistal"] = BodyNode.LeftMiddleFinger_Distal,
+        ["leftRingProximal"] = BodyNode.LeftRingFinger_Proximal,
+        ["leftRingIntermediate"] = BodyNode.LeftRingFinger_Intermediate,
+        ["leftRingDistal"] = BodyNode.LeftRingFinger_Distal,
+        ["leftLittleProximal"] = BodyNode.LeftPinky_Proximal,
+        ["leftLittleIntermediate"] = BodyNode.LeftPinky_Intermediate,
+        ["leftLittleDistal"] = BodyNode.LeftPinky_Distal,
+        ["rightIndexProximal"] = BodyNode.RightIndexFinger_Proximal,
+        ["rightIndexIntermediate"] = BodyNode.RightIndexFinger_Intermediate,
+        ["rightIndexDistal"] = BodyNode.RightIndexFinger_Distal,
+        ["rightMiddleProximal"] = BodyNode.RightMiddleFinger_Proximal,
+        ["rightMiddleIntermediate"] = BodyNode.RightMiddleFinger_Intermediate,
+        ["rightMiddleDistal"] = BodyNode.RightMiddleFinger_Distal,
+        ["rightRingProximal"] = BodyNode.RightRingFinger_Proximal,
+        ["rightRingIntermediate"] = BodyNode.RightRingFinger_Intermediate,
+        ["rightRingDistal"] = BodyNode.RightRingFinger_Distal,
+        ["rightLittleProximal"] = BodyNode.RightPinky_Proximal,
+        ["rightLittleIntermediate"] = BodyNode.RightPinky_Intermediate,
+        ["rightLittleDistal"] = BodyNode.RightPinky_Distal,
+    };
+
+    public static void Build(Slot root, VrmModel vrm, float? targetHeight, bool setupFaceTracking = false)
+    {
+        Dictionary<string, Slot> slotsByName = SlotIndex.Build(root);
+
+        BipedRig rig = SetupRig(root, vrm, slotsByName);
+        if (rig == null || !rig.IsBiped)
+        {
+            UniLog.Warning("ヒューマノイドの必須ボーンが揃っていないため、アバターセットアップをスキップします。");
+            return;
+        }
+
+        if (targetHeight.HasValue)
+        {
+            BoundingBox bounds = root.ComputeBoundingBox();
+            float currentHeight = bounds.Size.y;
+            if (currentHeight > 0.01f)
+            {
+                float factor = targetHeight.Value / currentHeight;
+                root.LocalScale *= factor;
+                UniLog.Log($"身長 {currentHeight:F3}m -> {targetHeight.Value:F3}m にリスケール (x{factor:F3})");
+            }
+        }
+
+        // Facing direction straight from the skeleton, independent of import rotations.
+        Slot hips = rig[BodyNode.Hips];
+        Slot head = rig[BodyNode.Head];
+        float3 up = (head.GlobalPosition - hips.GlobalPosition).Normalized;
+        float3 bodyRight = (rig[BodyNode.RightUpperArm].GlobalPosition - rig[BodyNode.LeftUpperArm].GlobalPosition).Normalized;
+        float3 forward = MathX.Cross(bodyRight, up).Normalized;
+
+        VRIK ik = rig.Slot.AttachComponent<VRIK>();
+        ik.Solver.SimulationSpace.Target = rig.Slot.Parent;
+        ik.Solver.OffsetSpace.Target = rig.Slot.Parent;
+        ik.Initiate();
+
+        // Temporary stand-ins for the headset / controller alignment objects the in-game
+        // AvatarCreator would have the user position manually.
+        Slot refs = root.World.AddSlot("VRM Avatar References");
+        try
+        {
+            Slot headsetRef = refs.AddSlot("Headset");
+            headsetRef.GlobalPosition = ComputeEyePosition(rig, vrm, up, forward);
+            headsetRef.GlobalRotation = floatQ.LookRotation(forward, up);
+
+            Slot leftRef = refs.AddSlot("LeftHand");
+            Slot rightRef = refs.AddSlot("RightHand");
+            SetupHandReference(rig, leftRef, isRight: false, up, forward);
+            SetupHandReference(rig, rightRef, isRight: true, up, forward);
+
+            Slot leftHand = rig[BodyNode.LeftHand];
+            Slot rightHand = rig[BodyNode.RightHand];
+            SetupToolAnchors(leftRef, leftHand);
+            SetupToolAnchors(rightRef, rightHand);
+
+            SetupEyesAndBlink(root, rig, vrm, headsetRef, slotsByName);
+
+            VRIKAvatar avatar = root.AttachComponent<VRIKAvatar>();
+            avatar.Setup(ik, rig, headsetRef, leftRef, rightRef, null, null, null);
+
+            IAvatarObject leftHandObject = root.GetComponentInChildren((IAvatarObject o) => o.Node == BodyNode.LeftHand);
+            IAvatarObject rightHandObject = root.GetComponentInChildren((IAvatarObject o) => o.Node == BodyNode.RightHand);
+            if (leftHandObject != null)
+            {
+                leftHandObject.Slot.AttachComponent<AvatarObjectComponentProxy>().Target.Target = leftHand;
+            }
+            if (rightHandObject != null)
+            {
+                rightHandObject.Slot.AttachComponent<AvatarObjectComponentProxy>().Target.Target = rightHand;
+            }
+        }
+        finally
+        {
+            refs.Destroy();
+        }
+
+        // Same root component shuffle as AvatarCreator.RunCreate.
+        root.GetComponentsInChildren<ObjectRoot>().ForEach(c => c.Destroy());
+        root.GetComponentsInChildren<Grabbable>().ForEach(c => c.Destroy());
+        root.GetComponentsInChildren<AvatarGroup>().ForEach(c => c.Destroy());
+        Grabbable grabbable = root.AttachComponent<Grabbable>();
+        root.AttachComponent<ObjectRoot>();
+        root.AttachComponent<AvatarGroup>();
+        root.AttachComponent<AvatarRoot>();
+        grabbable.CustomCanGrabCheck.Target = Grabbable.UserRootGrabCheck;
+
+        AvatarCreator.EnsureVoiceOutput(root, rig, volumeMeter: true);
+        HashSet<IField<float>> vrmVisemeFields = SetupVisemesFromVrm(root, vrm);
+        CleanupMisassignedVisemes(root, vrmVisemeFields);
+        if (setupFaceTracking)
+        {
+            AvatarCreator.TrySetupFaceTracking(root);
+        }
+        SetupAwayIndicator(root);
+
+        root.GetComponentInChildren((AvatarPoseNode n) => n.Node.Value == BodyNode.Head)?.InstrumentWithViewHeadOverride();
+        UniLog.Log("アバターセットアップ完了。");
+    }
+
+    // ---------------------------------------------------------------- rig
+
+    private static BipedRig SetupRig(Slot root, VrmModel vrm, Dictionary<string, Slot> slotsByName)
+    {
+        // The model importer may have already classified the rig heuristically;
+        // reuse the component but override every bone with the VRM's exact mapping.
+        // Multiple bone hierarchies can each get classified, so drop the extras.
+        List<BipedRig> existingRigs = root.GetComponentsInChildren<BipedRig>();
+        BipedRig rig = existingRigs.FirstOrDefault();
+        for (int i = 1; i < existingRigs.Count; i++)
+        {
+            existingRigs[i].Destroy();
+        }
+        if (rig == null)
+        {
+            Slot rigSlot = root.GetComponentInChildren<Rig>()?.Slot ?? root;
+            rig = rigSlot.AttachComponent<BipedRig>();
+        }
+
+        int mapped = 0;
+        foreach ((string vrmBone, int nodeIndex) in vrm.HumanBones)
+        {
+            if (!VrmBoneToBodyNode.TryGetValue(vrmBone, out BodyNode bodyNode))
+            {
+                continue;
+            }
+            string nodeName = vrm.GetNodeName(nodeIndex);
+            if (nodeName == null || !slotsByName.TryGetValue(nodeName, out Slot boneSlot))
+            {
+                UniLog.Warning($"VRMボーン '{vrmBone}' のノード '{nodeName}' に対応するスロットが見つかりません。");
+                continue;
+            }
+            rig[bodyNode] = boneSlot;
+            mapped++;
+        }
+        UniLog.Log($"VRMヒューマノイドマップからボーンを {mapped} 個割り当てました。");
+        rig.GuessForwardFlipped();
+        return rig;
+    }
+
+    // ---------------------------------------------------------------- alignment
+
+    private static float3 ComputeEyePosition(BipedRig rig, VrmModel vrm, float3 up, float3 forward)
+    {
+        Slot leftEye = rig.TryGetBone(BodyNode.LeftEye);
+        Slot rightEye = rig.TryGetBone(BodyNode.RightEye);
+        if (leftEye != null && rightEye != null)
+        {
+            return (leftEye.GlobalPosition + rightEye.GlobalPosition) * 0.5f;
+        }
+
+        Slot head = rig[BodyNode.Head];
+        float scale = MathX.Abs(head.GlobalScale.y);
+        if (vrm.FirstPersonOffset.HasValue)
+        {
+            System.Numerics.Vector3 offset = vrm.FirstPersonOffset.Value;
+            return head.GlobalPosition
+                   + up * offset.Y * scale
+                   + forward * MathX.Abs(offset.Z) * scale;
+        }
+        return head.GlobalPosition + up * 0.06f * scale + forward * 0.05f * scale;
+    }
+
+    /// <summary>
+    /// Positions and orients a hand reference deterministically from the skeleton:
+    /// +Z points from the wrist toward the middle finger, +Y along the back of the hand
+    /// (the orientation Resonite expects for hand alignment). VRIK's guessed palm axes
+    /// vary between models, so they are not used.
+    /// </summary>
+    private static void SetupHandReference(BipedRig rig, Slot reference, bool isRight, float3 modelUp, float3 modelForward)
+    {
+        Slot hand = rig[isRight ? BodyNode.RightHand : BodyNode.LeftHand];
+        float3 fingers = ComputeFingerDirection(rig, hand, isRight, modelForward);
+        float3 back = ComputeBackOfHand(rig, hand, fingers, isRight, modelUp);
+
+        floatQ handRotation = floatQ.LookRotation(fingers, back);
+        reference.GlobalPosition = hand.GlobalPosition;
+        reference.GlobalRotation = handRotation;
+
+        // Tool anchors share the same convention, sitting forward along the fingers.
+        foreach (string name in new[] { "Tooltip", "Grabber", "Shelf" })
+        {
+            Slot anchor = reference.AddSlot(name);
+            anchor.GlobalPosition = hand.GlobalPosition + fingers * 0.15f;
+            anchor.GlobalRotation = handRotation;
+        }
+    }
+
+    private static float3 ComputeFingerDirection(BipedRig rig, Slot hand, bool isRight, float3 modelForward)
+    {
+        BodyNode[] candidates = isRight
+            ? new[] { BodyNode.RightMiddleFinger_Proximal, BodyNode.RightIndexFinger_Proximal, BodyNode.RightRingFinger_Proximal }
+            : new[] { BodyNode.LeftMiddleFinger_Proximal, BodyNode.LeftIndexFinger_Proximal, BodyNode.LeftRingFinger_Proximal };
+        foreach (BodyNode candidate in candidates)
+        {
+            Slot finger = rig.TryGetBone(candidate);
+            if (finger != null)
+            {
+                float3 direction = finger.GlobalPosition - hand.GlobalPosition;
+                if (direction.Magnitude > 0.0001f)
+                {
+                    return direction.Normalized;
+                }
+            }
+        }
+        Slot lowerArm = rig.TryGetBone(isRight ? BodyNode.RightLowerArm : BodyNode.LeftLowerArm);
+        if (lowerArm != null)
+        {
+            float3 armDirection = hand.GlobalPosition - lowerArm.GlobalPosition;
+            if (armDirection.Magnitude > 0.0001f)
+            {
+                return armDirection.Normalized;
+            }
+        }
+        return modelForward;
+    }
+
+    private static float3 ComputeBackOfHand(BipedRig rig, Slot hand, float3 fingers, bool isRight, float3 modelUp)
+    {
+        float3 back = float3.Zero;
+        Slot thumb = rig.TryGetBone(isRight ? BodyNode.RightThumb_Metacarpal : BodyNode.LeftThumb_Metacarpal)
+                     ?? rig.TryGetBone(isRight ? BodyNode.RightThumb_Proximal : BodyNode.LeftThumb_Proximal);
+        if (thumb != null)
+        {
+            float3 thumbDirection = thumb.GlobalPosition - hand.GlobalPosition;
+            if (thumbDirection.Magnitude > 0.0001f)
+            {
+                thumbDirection = thumbDirection.Normalized;
+                back = isRight
+                    ? MathX.Cross(thumbDirection, fingers)
+                    : MathX.Cross(fingers, thumbDirection);
+            }
+        }
+        if (back.Magnitude < 0.0001f)
+        {
+            back = modelUp;
+        }
+        // VRM rest pose is a T-pose with palms down; the back of the hand points roughly up.
+        if (MathX.Dot(back, modelUp) < 0f)
+        {
+            back = -back;
+        }
+        back -= fingers * MathX.Dot(back, fingers);
+        return back.Magnitude > 0.0001f ? back.Normalized : modelUp;
+    }
+
+    private static void SetupToolAnchors(Slot handReference, Slot handBone)
+    {
+        SetupToolAnchor(handBone, handReference.FindChild("Tooltip"), AvatarToolAnchor.Point.Tool);
+        SetupToolAnchor(handBone, handReference.FindChild("Grabber"), AvatarToolAnchor.Point.GrabArea);
+        SetupToolAnchor(handBone, handReference.FindChild("Shelf"), AvatarToolAnchor.Point.Toolshelf);
+    }
+
+    private static void SetupToolAnchor(Slot anchorRoot, Slot anchorReference, AvatarToolAnchor.Point point)
+    {
+        if (anchorReference == null)
+        {
+            return;
+        }
+        Slot slot = anchorRoot.AddSlot(point + " Anchor");
+        slot.CopyTransform(anchorReference);
+        slot.AttachComponent<AvatarToolAnchor>().AnchorPoint.Value = point;
+    }
+
+    // ---------------------------------------------------------------- eyes & blink
+
+    private static void SetupEyesAndBlink(Slot root, BipedRig rig, VrmModel vrm, Slot headsetRef,
+        Dictionary<string, Slot> slotsByName)
+    {
+        Slot head = rig[BodyNode.Head];
+        Slot leftEye = rig.TryGetBone(BodyNode.LeftEye);
+        Slot rightEye = rig.TryGetBone(BodyNode.RightEye);
+
+        Slot managerSlot = head.AddSlot("Eye Manager");
+        managerSlot.CopyTransform(headsetRef);
+        EyeManager eyeManager = managerSlot.AttachComponent<EyeManager>();
+        managerSlot.AttachComponent<AvatarEyeDataSourceAssigner>().TargetReference.Target = eyeManager.EyeDataSource;
+        managerSlot.AttachComponent<AvatarUserReferenceAssigner>().References.Add(eyeManager.SimulatingUser);
+        eyeManager.IgnoreLocalUserHead.Value = true;
+
+        if (leftEye != null && rightEye != null)
+        {
+            // Same pivot construction as AvatarCreator.SetupEyes.
+            Slot leftPivot = leftEye.AddSlot("Left Eye Pivot");
+            Slot rightPivot = rightEye.AddSlot("Right Eye Pivot");
+            leftPivot.Parent = leftEye.Parent;
+            rightPivot.Parent = rightEye.Parent;
+            leftPivot.GlobalRotation = managerSlot.GlobalRotation;
+            rightPivot.GlobalRotation = managerSlot.GlobalRotation;
+            leftEye.Parent = leftPivot;
+            rightEye.Parent = rightPivot;
+
+            EyeRotationDriver rotationDriver = managerSlot.AttachComponent<EyeRotationDriver>();
+            rotationDriver.EyeManager.Target = eyeManager;
+            // The default (15) lets eyes swing far enough to clip through VRM face meshes.
+            rotationDriver.MaxSwing.Value = 4f;
+            EyeRotationDriver.Eye left = rotationDriver.Eyes.Add();
+            EyeRotationDriver.Eye right = rotationDriver.Eyes.Add();
+            left.Root.Target = leftPivot;
+            left.Side.Value = EyeSide.Left;
+            left.SetupFromRoot();
+            right.Root.Target = rightPivot;
+            right.Side.Value = EyeSide.Right;
+            right.SetupFromRoot();
+        }
+
+        EyeLinearDriver linearDriver = managerSlot.AttachComponent<EyeLinearDriver>();
+        linearDriver.EyeManager.Target = eyeManager;
+
+        var resolver = new BlendshapeResolver(root, vrm);
+        IField<float> blinkLeft = ResolveSingleBind(resolver, vrm, "blinkLeft");
+        IField<float> blinkRight = ResolveSingleBind(resolver, vrm, "blinkRight");
+        IField<float> blinkBoth = ResolveSingleBind(resolver, vrm, "blink");
+
+        if (blinkLeft != null && blinkRight != null)
+        {
+            EyeLinearDriver.Eye left = linearDriver.Eyes.Add();
+            EyeLinearDriver.Eye right = linearDriver.Eyes.Add();
+            left.Side.Value = EyeSide.Left;
+            right.Side.Value = EyeSide.Right;
+            left.OpenCloseTarget.Target = blinkLeft;
+            right.OpenCloseTarget.Target = blinkRight;
+        }
+        else if (blinkBoth != null)
+        {
+            EyeLinearDriver.Eye combined = linearDriver.Eyes.Add();
+            combined.Side.Value = EyeSide.Combined;
+            combined.OpenCloseTarget.Target = blinkBoth;
+        }
+
+        if (linearDriver.Eyes.Count == 0 && rotationDriverMissing(managerSlot))
+        {
+            // Nothing useful was created; keep hierarchy clean.
+            managerSlot.Destroy();
+        }
+
+        static bool rotationDriverMissing(Slot slot)
+        {
+            return slot.GetComponent<EyeRotationDriver>() == null;
+        }
+    }
+
+    private static IField<float> ResolveSingleBind(BlendshapeResolver resolver, VrmModel vrm, string preset)
+    {
+        VrmExpression expression = vrm.Expressions.FirstOrDefault(
+            e => string.Equals(e.Preset, preset, StringComparison.OrdinalIgnoreCase));
+        if (expression == null)
+        {
+            return null;
+        }
+        foreach (VrmExpressionBind bind in expression.Binds.OrderByDescending(b => b.Weight))
+        {
+            IField<float> field = resolver.Resolve(bind);
+            if (field != null)
+            {
+                return field;
+            }
+        }
+        return null;
+    }
+
+    // ---------------------------------------------------------------- visemes
+
+    private static readonly (string preset, Viseme viseme)[] VisemePresets =
+    {
+        ("aa", Viseme.aa),
+        ("ih", Viseme.ih),
+        ("ou", Viseme.ou),
+        ("ee", Viseme.E),
+        ("oh", Viseme.oh),
+    };
+
+    /// <summary>
+    /// Wires the five VRM vowel expressions directly to Resonite's viseme system,
+    /// overriding whatever the name heuristics in TrySetupVisemes guessed.
+    /// Returns the blendshape fields that were wired from VRM data.
+    /// </summary>
+    private static HashSet<IField<float>> SetupVisemesFromVrm(Slot root, VrmModel vrm)
+    {
+        var resolver = new BlendshapeResolver(root, vrm);
+        var drivers = new List<DirectVisemeDriver>();
+        var wiredFields = new HashSet<IField<float>>();
+
+        foreach ((string preset, Viseme viseme) in VisemePresets)
+        {
+            VrmExpression expression = vrm.Expressions.FirstOrDefault(
+                e => string.Equals(e.Preset, preset, StringComparison.OrdinalIgnoreCase));
+            if (expression == null)
+            {
+                continue;
+            }
+            foreach (VrmExpressionBind bind in expression.Binds.OrderByDescending(b => b.Weight))
+            {
+                (SkinnedMeshRenderer skin, IField<float> field) = resolver.ResolveWithRenderer(bind);
+                if (field == null)
+                {
+                    continue;
+                }
+                DirectVisemeDriver driver = skin.Slot.GetComponent<DirectVisemeDriver>()
+                                            ?? skin.Slot.AttachComponent<DirectVisemeDriver>();
+                driver[viseme].ForceLink(field);
+                wiredFields.Add(field);
+                if (!drivers.Contains(driver))
+                {
+                    drivers.Add(driver);
+                }
+                break; // primary bind only per viseme
+            }
+        }
+        if (drivers.Count == 0)
+        {
+            return wiredFields;
+        }
+
+        VisemeAnalyzer analyzer = root.GetComponentInChildren<VisemeAnalyzer>();
+        if (analyzer == null)
+        {
+            Slot head = root.GetComponentInChildren((IAvatarObject o) => o.Node == BodyNode.Head)?.Slot ?? root;
+            analyzer = head.AttachComponent<VisemeAnalyzer>();
+            head.AttachComponent<AvatarVoiceSourceAssigner>().TargetReference.Target = analyzer.Source;
+        }
+        foreach (DirectVisemeDriver driver in drivers)
+        {
+            if (driver.Source.Target == null)
+            {
+                driver.Source.Target = analyzer;
+            }
+        }
+        UniLog.Log($"VRMの母音表情からビセームを設定しました ({drivers.Count} ドライバー)。");
+        return wiredFields;
+    }
+
+    /// <summary>
+    /// Name parts that indicate a blendshape is not a mouth shape. Resonite's viseme
+    /// auto-assign heuristics can mis-link these (e.g. VRoid's Fcl_EYE_Joy_R landing
+    /// on the RR viseme), so such links get released again.
+    /// </summary>
+    private static readonly HashSet<string> NonMouthNameParts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "eye", "eyes", "blink", "wink", "brow", "brw", "joy", "happy",
+        "angry", "sorrow", "sad", "fun", "surprised", "ha",
+    };
+
+    private static readonly string[] NonMouthNameFragments = { "まばたき", "ウィンク" };
+
+    private static void CleanupMisassignedVisemes(Slot root, HashSet<IField<float>> vrmWiredFields)
+    {
+        int released = 0;
+        foreach (DirectVisemeDriver driver in root.GetComponentsInChildren<DirectVisemeDriver>())
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                FieldDrive<float> drive = driver[(Viseme)i];
+                IField<float> target = drive.Target;
+                if (target == null || vrmWiredFields.Contains(target))
+                {
+                    continue;
+                }
+                string blendshapeName = FindBlendshapeName(target);
+                if (blendshapeName != null && IsNonMouthShape(blendshapeName))
+                {
+                    UniLog.Log($"ビセーム {(Viseme)i} から口以外のシェイプ '{blendshapeName}' の誤登録を解除しました。");
+                    drive.ReleaseLink();
+                    released++;
+                }
+            }
+        }
+        if (released > 0)
+        {
+            UniLog.Log($"誤登録ビセームを {released} 件解除しました。");
+        }
+    }
+
+    private static string FindBlendshapeName(IField<float> field)
+    {
+        SkinnedMeshRenderer skin = field.FindNearestParent<SkinnedMeshRenderer>();
+        if (skin == null)
+        {
+            return null;
+        }
+        for (int i = 0; i < skin.MeshBlendshapeCount; i++)
+        {
+            if (ReferenceEquals(skin.BlendShapeWeights.GetElement(i), field))
+            {
+                return skin.BlendShapeName(i);
+            }
+        }
+        return null;
+    }
+
+    private static bool IsNonMouthShape(string blendshapeName)
+    {
+        foreach (string fragment in NonMouthNameFragments)
+        {
+            if (blendshapeName.Contains(fragment, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        string[] parts = blendshapeName.Split('_', '.', ' ', '-', '(', ')');
+        return parts.Any(part => NonMouthNameParts.Contains(part));
+    }
+
+    // ---------------------------------------------------------------- misc avatar bits
+
+    /// <summary>Replicates AvatarCreator.SetupAwayIndicator (private in FrooxEngine).</summary>
+    private static void SetupAwayIndicator(Slot root)
+    {
+        IAvatarObject headObject = root.GetComponentInChildren((IAvatarObject o) => o.Node == BodyNode.Head);
+        if (headObject == null)
+        {
+            return;
+        }
+        AvatarUserReferenceAssigner assigner = headObject.Slot.AttachComponent<AvatarUserReferenceAssigner>();
+        IAssetProvider<FrooxEngine.Material> awayMaterial = SimpleAwayIndicator.CreateAwayMaterial(root);
+        foreach (MeshRenderer renderer in root.GetComponentsInChildren<MeshRenderer>())
+        {
+            SimpleAwayIndicator indicator = renderer.Slot.AttachComponent<SimpleAwayIndicator>();
+            indicator.AwayMaterial.Target = awayMaterial;
+            indicator.Renderer.Target = renderer;
+            assigner.References.Add(indicator.User);
+        }
+    }
+}
+
+/// <summary>Builds a name -> slot index over an imported hierarchy (first occurrence wins).</summary>
+internal static class SlotIndex
+{
+    public static Dictionary<string, Slot> Build(Slot root)
+    {
+        var index = new Dictionary<string, Slot>();
+        void Walk(Slot slot)
+        {
+            string name = slot.Name ?? "";
+            if (!index.ContainsKey(name))
+            {
+                index[name] = slot;
+            }
+            foreach (Slot child in slot.Children)
+            {
+                Walk(child);
+            }
+        }
+        Walk(root);
+        return index;
+    }
+}
+
+/// <summary>
+/// Maps a VRM morph-target bind (mesh index + morph index) onto an imported
+/// SkinnedMeshRenderer blendshape field, preferring name matches via targetNames
+/// and falling back to raw indices.
+/// </summary>
+internal sealed class BlendshapeResolver
+{
+    private readonly VrmModel _vrm;
+    private readonly List<SkinnedMeshRenderer> _renderers;
+    private readonly Dictionary<string, Slot> _slotsByName;
+
+    public BlendshapeResolver(Slot root, VrmModel vrm)
+    {
+        _vrm = vrm;
+        _renderers = root.GetComponentsInChildren<SkinnedMeshRenderer>();
+        _slotsByName = SlotIndex.Build(root);
+    }
+
+    public IField<float> Resolve(VrmExpressionBind bind)
+    {
+        return ResolveWithRenderer(bind).field;
+    }
+
+    public (SkinnedMeshRenderer skin, IField<float> field) ResolveWithRenderer(VrmExpressionBind bind)
+    {
+        string targetName = null;
+        if (bind.MeshIndex >= 0 && bind.MeshIndex < _vrm.MeshTargetNames.Count)
+        {
+            List<string> names = _vrm.MeshTargetNames[bind.MeshIndex];
+            if (bind.MorphIndex >= 0 && bind.MorphIndex < names.Count && !string.IsNullOrEmpty(names[bind.MorphIndex]))
+            {
+                targetName = names[bind.MorphIndex];
+            }
+        }
+
+        foreach (SkinnedMeshRenderer skin in EnumerateCandidates(bind))
+        {
+            if (targetName != null)
+            {
+                IField<float> byName = skin.TryGetBlendShape(targetName);
+                if (byName != null)
+                {
+                    return (skin, byName);
+                }
+            }
+        }
+        foreach (SkinnedMeshRenderer skin in EnumerateCandidates(bind))
+        {
+            if (bind.MorphIndex >= 0 && bind.MorphIndex < skin.MeshBlendshapeCount)
+            {
+                return (skin, skin.BlendShapeWeights.GetElement(bind.MorphIndex));
+            }
+        }
+        UniLog.Warning($"ブレンドシェイプが見つかりません: mesh={bind.MeshIndex}, morph={bind.MorphIndex}, name={targetName ?? "(なし)"}");
+        return (null, null);
+    }
+
+    private IEnumerable<SkinnedMeshRenderer> EnumerateCandidates(VrmExpressionBind bind)
+    {
+        // Renderers under slots named like the glTF nodes that reference the mesh come first.
+        if (_vrm.MeshToNodes.TryGetValue(bind.MeshIndex, out List<int> nodes))
+        {
+            foreach (int nodeIndex in nodes)
+            {
+                string nodeName = _vrm.GetNodeName(nodeIndex);
+                if (nodeName != null && _slotsByName.TryGetValue(nodeName, out Slot slot))
+                {
+                    foreach (SkinnedMeshRenderer skin in slot.GetComponentsInChildren<SkinnedMeshRenderer>())
+                    {
+                        yield return skin;
+                    }
+                }
+            }
+        }
+        foreach (SkinnedMeshRenderer skin in _renderers)
+        {
+            yield return skin;
+        }
+    }
+}
