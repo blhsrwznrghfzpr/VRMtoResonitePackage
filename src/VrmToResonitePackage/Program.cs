@@ -8,9 +8,15 @@ namespace VrmToResonitePackage;
 /// </summary>
 internal static class Program
 {
+    [STAThread]
     private static int Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
+        if (ShouldLaunchGui(args))
+        {
+            return GuiApp.Run(args.Where(File.Exists).Select(Path.GetFullPath).ToArray());
+        }
+
         Console.WriteLine("VRM -> ResonitePackage converter");
         Console.WriteLine();
 
@@ -74,6 +80,15 @@ internal static class Program
             Environment.Exit(1);
             return 1;
         }
+    }
+
+    private static bool ShouldLaunchGui(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            return true;
+        }
+        return args.All(arg => File.Exists(arg) && string.Equals(Path.GetExtension(arg), ".vrm", StringComparison.OrdinalIgnoreCase));
     }
 
     // NoInlining keeps FrooxEngine types from being JIT-resolved before the resolver is installed.
