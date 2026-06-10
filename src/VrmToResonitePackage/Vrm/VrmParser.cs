@@ -134,6 +134,11 @@ public static class VrmParser
                     Vec3 e = ReadVec3Array(emissive);
                     info.EmissionColor = new Vec4(e.X, e.Y, e.Z, 1f);
                 }
+                if (mat.TryGetProperty("pbrMetallicRoughness", out JsonElement pbr) &&
+                    pbr.TryGetProperty("baseColorFactor", out JsonElement baseColor))
+                {
+                    info.BaseColor = ReadVec4Array(baseColor);
+                }
                 if (mat.TryGetProperty("extensions", out JsonElement matExt) &&
                     matExt.TryGetProperty("VRMC_materials_mtoon", out JsonElement mtoon))
                 {
@@ -172,6 +177,60 @@ public static class VrmParser
                         {
                             info.OutlineWidthImageIndex = image;
                         }
+                    }
+                    info.OutlineLightingMix = mtoon.TryGetProperty("outlineLightingMixFactor", out JsonElement olm)
+                        ? olm.GetSingle() : 1f;
+
+                    info.TransparentWithZWrite =
+                        mtoon.TryGetProperty("transparentWithZWrite", out JsonElement zw) && zw.GetBoolean();
+                    if (mtoon.TryGetProperty("renderQueueOffsetNumber", out JsonElement rqo))
+                    {
+                        info.RenderQueueOffset = rqo.GetInt32();
+                    }
+
+                    info.ShadingShift = mtoon.TryGetProperty("shadingShiftFactor", out JsonElement ssf)
+                        ? ssf.GetSingle() : 0f;
+                    info.ShadingToony = mtoon.TryGetProperty("shadingToonyFactor", out JsonElement stf)
+                        ? stf.GetSingle() : 0.9f;
+                    if (mtoon.TryGetProperty("shadingShiftTexture", out JsonElement sst))
+                    {
+                        if (sst.TryGetProperty("index", out JsonElement sstIndex))
+                        {
+                            int image = ResolveImage(sstIndex.GetInt32());
+                            if (image >= 0)
+                            {
+                                info.ShadingShiftImageIndex = image;
+                            }
+                        }
+                        info.ShadingShiftTextureScale = sst.TryGetProperty("scale", out JsonElement sstScale)
+                            ? sstScale.GetSingle() : 1f;
+                    }
+
+                    if (mtoon.TryGetProperty("parametricRimColorFactor", out JsonElement rim))
+                    {
+                        Vec3 r = ReadVec3Array(rim);
+                        info.RimColor = new Vec4(r.X, r.Y, r.Z, 1f);
+                    }
+                    info.RimLightingMix = mtoon.TryGetProperty("rimLightingMixFactor", out JsonElement rlm)
+                        ? rlm.GetSingle() : 1f;
+                    info.RimFresnelPower = mtoon.TryGetProperty("parametricRimFresnelPowerFactor", out JsonElement rfp)
+                        ? rfp.GetSingle() : 5f;
+                    info.RimLift = mtoon.TryGetProperty("parametricRimLiftFactor", out JsonElement rlf)
+                        ? rlf.GetSingle() : 0f;
+
+                    if (mtoon.TryGetProperty("matcapTexture", out JsonElement matcap) &&
+                        matcap.TryGetProperty("index", out JsonElement matcapIndex))
+                    {
+                        int image = ResolveImage(matcapIndex.GetInt32());
+                        if (image >= 0)
+                        {
+                            info.MatcapImageIndex = image;
+                        }
+                    }
+                    if (mtoon.TryGetProperty("matcapFactor", out JsonElement matcapFactor))
+                    {
+                        Vec3 m = ReadVec3Array(matcapFactor);
+                        info.MatcapColor = new Vec4(m.X, m.Y, m.Z, 1f);
                     }
                 }
                 model.Materials[name] = info;
@@ -351,6 +410,16 @@ public static class VrmParser
                 string shader = GetString(mat, "shader") ?? "";
                 info.IsMToon = shader.Contains("MToon", StringComparison.OrdinalIgnoreCase);
 
+                if (mat.TryGetProperty("renderQueue", out JsonElement renderQueue) &&
+                    renderQueue.ValueKind == JsonValueKind.Number)
+                {
+                    int queue = renderQueue.GetInt32();
+                    if (queue > 0)
+                    {
+                        info.RenderQueue = queue;
+                    }
+                }
+
                 if (mat.TryGetProperty("keywordMap", out JsonElement keywords))
                 {
                     if (keywords.TryGetProperty("_ALPHABLEND_ON", out JsonElement ab) && ab.GetBoolean())
@@ -391,17 +460,56 @@ public static class VrmParser
                         // 0 = off (double sided), 1 = front, 2 = back.
                         info.DoubleSided = (int)cull.GetSingle() == 0;
                     }
+                    info.TransparentWithZWrite = info.AlphaMode == "blend" &&
+                        (!floats.TryGetProperty("_ZWrite", out JsonElement zwrite) || zwrite.GetSingle() >= 0.5f);
+
+                    // MToon 0.x shading params -> MToon 1.0 semantics, per UniVRM's
+                    // MToon10Migrator (range min/max -> toony = margin, shift = -center).
+                    float shadeShift0 = floats.TryGetProperty("_ShadeShift", out JsonElement ss0)
+                        ? ss0.GetSingle() : 0f;
+                    float shadeToony0 = floats.TryGetProperty("_ShadeToony", out JsonElement st0)
+                        ? st0.GetSingle() : 0.9f;
+                    float rangeMin = shadeShift0;
+                    float rangeMax = shadeShift0 + (1f - shadeShift0) * (1f - shadeToony0);
+                    info.ShadingToony = Math.Clamp((2f - (rangeMax - rangeMin)) * 0.5f, 0f, 1f);
+                    info.ShadingShift = Math.Clamp((rangeMax + rangeMin) * 0.5f * -1f, -1f, 1f);
+
+                    // Outline color mode Fixed (0) means unlit fixed color -> lighting mix 0.
+                    float outlineColorMode = floats.TryGetProperty("_OutlineColorMode", out JsonElement ocm)
+                        ? ocm.GetSingle() : 0f;
+                    float outlineLightingMix = floats.TryGetProperty("_OutlineLightingMix", out JsonElement olm0)
+                        ? olm0.GetSingle() : 1f;
+                    info.OutlineLightingMix = (int)outlineColorMode == 0 ? 0f : outlineLightingMix;
+
+                    info.RimLightingMix = floats.TryGetProperty("_RimLightingMix", out JsonElement rlm0)
+                        ? rlm0.GetSingle() : 0f;
+                    info.RimFresnelPower = floats.TryGetProperty("_RimFresnelPower", out JsonElement rfp0)
+                        ? rfp0.GetSingle() : 1f;
+                    info.RimLift = floats.TryGetProperty("_RimLift", out JsonElement rlf0)
+                        ? rlf0.GetSingle() : 0f;
                 }
-                if (mat.TryGetProperty("textureProperties", out JsonElement textureProps) &&
-                    textureProps.TryGetProperty("_OutlineWidthTexture", out JsonElement outlineTexture))
+                if (mat.TryGetProperty("textureProperties", out JsonElement textureProps))
                 {
-                    int textureIndex = outlineTexture.GetInt32();
-                    int imageIndex = textureIndex >= 0 && textureIndex < model.TextureToImage.Count
-                        ? model.TextureToImage[textureIndex]
-                        : -1;
-                    if (imageIndex >= 0)
+                    int ResolveVrm0Image(string property)
                     {
-                        info.OutlineWidthImageIndex = imageIndex;
+                        if (!textureProps.TryGetProperty(property, out JsonElement texture))
+                        {
+                            return -1;
+                        }
+                        int textureIndex = texture.GetInt32();
+                        return textureIndex >= 0 && textureIndex < model.TextureToImage.Count
+                            ? model.TextureToImage[textureIndex]
+                            : -1;
+                    }
+                    int outlineImage = ResolveVrm0Image("_OutlineWidthTexture");
+                    if (outlineImage >= 0)
+                    {
+                        info.OutlineWidthImageIndex = outlineImage;
+                    }
+                    int matcapImage = ResolveVrm0Image("_SphereAdd");
+                    if (matcapImage >= 0)
+                    {
+                        info.MatcapImageIndex = matcapImage;
                     }
                 }
                 if (mat.TryGetProperty("vectorProperties", out JsonElement vectors))
@@ -410,6 +518,10 @@ public static class VrmParser
                     {
                         info.ShadeColor = ReadVec4Array(shade);
                     }
+                    if (vectors.TryGetProperty("_Color", out JsonElement baseColor))
+                    {
+                        info.BaseColor = ReadVec4Array(baseColor);
+                    }
                     if (vectors.TryGetProperty("_OutlineColor", out JsonElement outline))
                     {
                         info.OutlineColor = ReadVec4Array(outline);
@@ -417,6 +529,10 @@ public static class VrmParser
                     if (vectors.TryGetProperty("_EmissionColor", out JsonElement emission))
                     {
                         info.EmissionColor = ReadVec4Array(emission);
+                    }
+                    if (vectors.TryGetProperty("_RimColor", out JsonElement rim))
+                    {
+                        info.RimColor = ReadVec4Array(rim);
                     }
                 }
             }

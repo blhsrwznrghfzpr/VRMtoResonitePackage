@@ -57,6 +57,11 @@ internal static class LocalDbMaintenance
         DeleteWithRetry(logFile);
         DeleteWithRetry(databaseFile);
         // LocalKey.bin is kept so the machine identity stays stable.
+        if (File.Exists(databaseFile))
+        {
+            throw new IOException($"破損したデータベースを削除できませんでした: {databaseFile}");
+        }
+        UniLog.Log($"LocalDBをリセットしました: {databaseFile}");
     }
 
     /// <summary>Returns the child's verdict, or Broken when the probe cannot run/finish.</summary>

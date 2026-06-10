@@ -117,6 +117,15 @@ public sealed class VrmMaterialInfo
     public float AlphaCutoff { get; set; } = 0.5f;
     public bool DoubleSided { get; set; }
 
+    /// <summary>MToon "transparent with ZWrite" flag (VRM0: _ZWrite on a blend material).</summary>
+    public bool TransparentWithZWrite { get; set; }
+
+    /// <summary>Explicit Unity render queue (VRM0 stores it directly).</summary>
+    public int? RenderQueue { get; set; }
+
+    /// <summary>VRM1 renderQueueOffsetNumber.</summary>
+    public int RenderQueueOffset { get; set; }
+
     /// <summary>Outline width normalized to meters (MToon 0.x stores centimeters).</summary>
     public float OutlineWidth { get; set; }
 
@@ -126,7 +135,25 @@ public sealed class VrmMaterialInfo
     /// <summary>glTF image index of the outline width multiply texture, if any.</summary>
     public int? OutlineWidthImageIndex { get; set; }
 
+    /// <summary>MToon10 outlineLightingMixFactor (VRM0: 0 when color mode is Fixed).</summary>
+    public float OutlineLightingMix { get; set; }
+
     public System.Numerics.Vector4? OutlineColor { get; set; }
     public System.Numerics.Vector4? ShadeColor { get; set; }
+    public System.Numerics.Vector4? BaseColor { get; set; }
     public System.Numerics.Vector4? EmissionColor { get; set; }
+
+    /// <summary>Shading parameters normalized to MToon 1.0 semantics.</summary>
+    public float ShadingToony { get; set; } = 0.9f;
+    public float ShadingShift { get; set; }
+    public int? ShadingShiftImageIndex { get; set; }
+    public float ShadingShiftTextureScale { get; set; } = 1f;
+
+    public System.Numerics.Vector4 RimColor { get; set; }
+    public float RimLightingMix { get; set; }
+    public float RimFresnelPower { get; set; } = 5f;
+    public float RimLift { get; set; }
+
+    public int? MatcapImageIndex { get; set; }
+    public System.Numerics.Vector4 MatcapColor { get; set; } = new(1f, 1f, 1f, 1f);
 }

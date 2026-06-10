@@ -1,31 +1,38 @@
+using Elements.Assets;
 using Elements.Core;
 using FrooxEngine;
 using FrooxEngine.Store;
 using VrmToResonitePackage.Vrm;
+using ColorProfile = Renderite.Shared.ColorProfile;
+using TextureFormat = Renderite.Shared.TextureFormat;
+using TextureWrapMode = Renderite.Shared.TextureWrapMode;
 
 namespace VrmToResonitePackage;
 
 /// <summary>
 /// Post-processes the XiexeToon materials created by the model importer with
-/// MToon parameters from the VRM (blend mode, cutoff, outlines, double-sidedness).
+/// MToon parameters from the VRM. The mapping follows Resonite's official
+/// MToon10XiexeConverter (Resonite.UnitySDK) wherever the data allows.
 /// </summary>
 internal static class MaterialTuner
 {
     public static async Task Apply(Slot root, Slot assetsSlot, VrmModel vrm, string vrmPath)
     {
         int tuned = 0;
-        var outlineMaskCache = new Dictionary<int, StaticTexture2D>();
+        var textureCache = new Dictionary<int, StaticTexture2D>();
+        var rampCache = new Dictionary<string, StaticTexture2D>();
         foreach (XiexeToonMaterial material in assetsSlot.GetComponentsInChildren<XiexeToonMaterial>())
         {
-            // XiexeToon attaches a default shadow ramp texture on creation; MToon's look
-            // is closer to a rampless material with a soft shadow edge.
-            material.ShadowRamp.Target = null;
-            material.ShadowSharpness.Value = 0f;
-
             VrmMaterialInfo info = FindInfo(vrm, material.Slot.Name);
             if (info != null)
             {
-                await ApplyInfo(material, info, vrm, vrmPath, assetsSlot, outlineMaskCache);
+                await ApplyInfo(material, info, vrmPath, assetsSlot, textureCache, rampCache);
+            }
+            else
+            {
+                // No MToon data: a rampless soft shadow is the closest neutral look.
+                material.ShadowRamp.Target = null;
+                material.ShadowSharpness.Value = 0f;
             }
             tuned++;
         }
@@ -56,35 +63,71 @@ internal static class MaterialTuner
         return null;
     }
 
-    private static async Task ApplyInfo(XiexeToonMaterial material, VrmMaterialInfo info, VrmModel vrm,
-        string vrmPath, Slot assetsSlot, Dictionary<int, StaticTexture2D> outlineMaskCache)
+    private static async Task ApplyInfo(XiexeToonMaterial material, VrmMaterialInfo info,
+        string vrmPath, Slot assetsSlot,
+        Dictionary<int, StaticTexture2D> textureCache, Dictionary<string, StaticTexture2D> rampCache)
     {
+        // --- Alpha handling (MToon spec: explicit ZWrite + render queue) ---
         switch (info.AlphaMode)
         {
             case "blend":
                 material.BlendMode.Value = BlendMode.Alpha;
-                // Alpha blending defaults to the transparent queue (3000), which can
-                // break sorting badly on converted MToon avatars; the opaque queue
-                // (2000) avoids the worst artifacts.
-                material.RenderQueue.Value = 2000;
+                material.ZWrite.Value = info.TransparentWithZWrite ? ZWrite.On : ZWrite.Off;
                 break;
             case "mask":
                 material.BlendMode.Value = BlendMode.Cutout;
                 material.AlphaClip.Value = info.AlphaCutoff;
+                material.ZWrite.Value = ZWrite.On;
                 break;
             default:
                 material.BlendMode.Value = BlendMode.Opaque;
+                material.ZWrite.Value = ZWrite.On;
                 break;
         }
+        material.RenderQueue.Value = ComputeRenderQueue(info);
 
         if (info.DoubleSided)
         {
             material.Culling.Value = Culling.Off;
         }
 
+        // --- Neutral PBR-ish features MToon doesn't have ---
+        material.Saturation.Value = 1f;
+        material.Metallic.Value = 0f;
+        material.Glossiness.Value = 0f;
+        material.Reflectivity.Value = 0f;
+        material.SpecularIntensity.Value = 0f;
+        material.SpecularArea.Value = 0.5f;
+        material.UseVertexColors.Value = false;
+
+        // --- Rim lighting ---
+        System.Numerics.Vector4 rim = info.RimColor;
+        material.RimColor.Value = new colorX(rim.X, rim.Y, rim.Z, 1f);
+        material.RimAlbedoTint.Value = 0f;
+        material.RimAttenuationEffect.Value = info.RimLightingMix;
+        material.RimIntensity.Value = MathX.Max(rim.X, rim.Y, rim.Z);
+        material.RimRange.Value = 1f / MathX.Max(info.RimFresnelPower, 0.001f);
+        material.RimThreshold.Value = info.RimLift;
+        material.RimSharpness.Value = 0.5f;
+
+        // --- Emission ---
+        if (info.EmissionColor.HasValue)
+        {
+            System.Numerics.Vector4 e = info.EmissionColor.Value;
+            if (e.X + e.Y + e.Z > 0.001f)
+            {
+                material.EmissionColor.Value = new colorX(e.X, e.Y, e.Z, 1f, ColorProfile.Linear);
+            }
+        }
+
+        // --- Outline ---
         if (info.OutlineWidth > 0.00001f && info.OutlineWidthMode != "none")
         {
-            material.Outline.Value = XiexeToonMaterial.OutlineStyle.Emissive;
+            bool lit = info.OutlineLightingMix >= 0.5f;
+            material.Outline.Value = lit
+                ? XiexeToonMaterial.OutlineStyle.Lit
+                : XiexeToonMaterial.OutlineStyle.Emissive;
+            material.OutlineAlbedoTint.Value = lit;
             // XiexeToon (XSToon2.0) extrudes outlines in object space by
             // _OutlineWidth * 0.01, MToon's world mode extrudes by the width in
             // meters — so at model scale 1 the conversion is width_m * 100.
@@ -97,38 +140,155 @@ internal static class MaterialTuner
             }
             if (info.OutlineWidthImageIndex.HasValue)
             {
-                StaticTexture2D mask = await GetOrImportTexture(
-                    assetsSlot, vrmPath, info.OutlineWidthImageIndex.Value, outlineMaskCache);
+                StaticTexture2D mask = await GetOrImportTexture(assetsSlot, vrmPath,
+                    info.OutlineWidthImageIndex.Value, textureCache, "OutlineMask");
                 if (mask != null)
                 {
                     material.OutlineMask.Target = mask;
                 }
             }
         }
-
-        if (info.EmissionColor.HasValue && material.EmissionMap.Target != null)
+        else
         {
-            System.Numerics.Vector4 e = info.EmissionColor.Value;
-            if (e.X + e.Y + e.Z > 0.001f)
-            {
-                material.EmissionColor.Value = new colorX(e.X, e.Y, e.Z, 1f);
-            }
+            material.Outline.Value = XiexeToonMaterial.OutlineStyle.None;
         }
 
-        if (info.ShadeColor.HasValue)
+        // --- Shadow ramp generated from the MToon shading parameters ---
+        if (info.IsMToon)
         {
-            // Approximate MToon's shade tint with Xiexe's shadow rim color.
-            System.Numerics.Vector4 s = info.ShadeColor.Value;
-            material.ShadowRim.Value = new colorX(s.X, s.Y, s.Z, 1f);
+            StaticTexture2D ramp = await GetOrGenerateShadowRamp(assetsSlot, info, rampCache);
+            material.ShadowRamp.Target = ramp;
+            if (info.ShadingShiftImageIndex.HasValue)
+            {
+                StaticTexture2D shiftMask = await GetOrImportTexture(assetsSlot, vrmPath,
+                    info.ShadingShiftImageIndex.Value, textureCache, "ShadingShiftMask");
+                if (shiftMask != null)
+                {
+                    material.ShadowRampMask.Target = shiftMask;
+                }
+            }
+            material.ShadowRim.Value = colorX.White;
+            material.ShadowSharpness.Value = 0f;
+            material.ShadowRimRange.Value = 0.7f;
+            material.ShadowRimThreshold.Value = 0.1f;
+            material.ShadowRimSharpness.Value = 0.3f;
+            material.ShadowRimAlbedoTint.Value = 0f;
+        }
+        else
+        {
+            material.ShadowRamp.Target = null;
+            material.ShadowSharpness.Value = 0f;
+        }
+
+        // --- Matcap ---
+        if (info.MatcapImageIndex.HasValue)
+        {
+            StaticTexture2D matcap = await GetOrImportTexture(assetsSlot, vrmPath,
+                info.MatcapImageIndex.Value, textureCache, "Matcap");
+            if (matcap != null)
+            {
+                material.Matcap.Target = matcap;
+                System.Numerics.Vector4 tint = info.MatcapColor;
+                material.MatcapTint.Value = new colorX(tint.X, tint.Y, tint.Z, 1f);
+            }
         }
     }
 
+    /// <summary>Unity render queue, following the MToon 1.0 queue layout.</summary>
+    private static int ComputeRenderQueue(VrmMaterialInfo info)
+    {
+        if (info.RenderQueue.HasValue)
+        {
+            return info.RenderQueue.Value; // VRM0 stores the queue explicitly
+        }
+        return info.AlphaMode switch
+        {
+            "blend" when info.TransparentWithZWrite => 2501 + Math.Clamp(info.RenderQueueOffset, 0, 9),
+            "blend" => 3000 + Math.Clamp(info.RenderQueueOffset, -9, 0),
+            "mask" => 2450,
+            _ => 2000,
+        };
+    }
+
+    // ---------------------------------------------------------------- shadow ramp
+
+    /// <summary>
+    /// Bakes the MToon shading band (shadeColor, shadingShift, shadingToony) into a
+    /// 256x256 ramp texture, the same way Resonite's official MToon converter does.
+    /// X = remapped N·L, Y = shading shift mask value.
+    /// </summary>
+    private static async Task<StaticTexture2D> GetOrGenerateShadowRamp(Slot assetsSlot,
+        VrmMaterialInfo info, Dictionary<string, StaticTexture2D> cache)
+    {
+        System.Numerics.Vector4 baseColor = info.BaseColor ?? new(1f, 1f, 1f, 1f);
+        System.Numerics.Vector4 shadeColor = info.ShadeColor ?? new(1f, 1f, 1f, 1f);
+        float texScale = info.ShadingShiftImageIndex.HasValue ? info.ShadingShiftTextureScale : 0f;
+
+        string key = FormattableString.Invariant(
+            $"{shadeColor.X:F4},{shadeColor.Y:F4},{shadeColor.Z:F4}/{baseColor.X:F4},{baseColor.Y:F4},{baseColor.Z:F4}/{info.ShadingToony:F4}/{info.ShadingShift:F4}/{texScale:F4}");
+        if (cache.TryGetValue(key, out StaticTexture2D cached))
+        {
+            return cached;
+        }
+
+        Engine engine = assetsSlot.Engine;
+        await default(ToBackground);
+        const int rampSize = 256;
+        var bitmap = new Bitmap2D(rampSize, rampSize, TextureFormat.RGBA32, mipmaps: false, ColorProfile.sRGB);
+        var shadowMultiplier = new color(
+            SafeColorRatio(shadeColor.X, baseColor.X),
+            SafeColorRatio(shadeColor.Y, baseColor.Y),
+            SafeColorRatio(shadeColor.Z, baseColor.Z),
+            1f);
+        float shadeMin = -1f + info.ShadingToony;
+        float shadeMax = 1f - info.ShadingToony;
+        float shadeRange = MathX.Max(shadeMax - shadeMin, 0.0001f);
+        for (int y = 0; y < rampSize; y++)
+        {
+            float mask = y / (rampSize - 1f);
+            float effectiveShift = info.ShadingShift + mask * texScale;
+            for (int x = 0; x < rampSize; x++)
+            {
+                float dotNL = MathX.Lerp(-1f, 1f, x / (rampSize - 1f));
+                float lit = MathX.Clamp01((dotNL + effectiveShift - shadeMin) / shadeRange);
+                var pixel = new color(
+                    MathX.Lerp(shadowMultiplier.r, 1f, lit),
+                    MathX.Lerp(shadowMultiplier.g, 1f, lit),
+                    MathX.Lerp(shadowMultiplier.b, 1f, lit),
+                    1f);
+                bitmap.SetPixel(x, y, in pixel);
+            }
+        }
+        Uri uri = await engine.LocalDB.SaveAssetAsync(bitmap);
+        await default(ToWorld);
+
+        Slot rampSlot = assetsSlot.AddSlot($"ShadowRamp {info.Name}");
+        StaticTexture2D texture = rampSlot.AttachComponent<StaticTexture2D>();
+        texture.URL.Value = uri;
+        texture.Uncompressed.Value = true;
+        texture.WrapMode = TextureWrapMode.Clamp;
+        cache[key] = texture;
+        return texture;
+    }
+
+    private static float SafeColorRatio(float numerator, float denominator)
+    {
+        if (denominator <= 0.0001f)
+        {
+            return MathX.Clamp01(numerator);
+        }
+        return MathX.Clamp01(numerator / denominator);
+    }
+
+    // ---------------------------------------------------------------- texture import
+
     /// <summary>
     /// Imports an embedded GLB image as a texture asset. Used for MToon-only textures
-    /// (outline width mask) that the regular model import never touches.
+    /// (outline width mask, matcap, shading shift mask) that the regular model import
+    /// never touches.
     /// </summary>
     private static async Task<StaticTexture2D> GetOrImportTexture(Slot assetsSlot, string vrmPath,
-        int imageIndex, Dictionary<int, StaticTexture2D> cache)
+        int imageIndex, Dictionary<int, StaticTexture2D> cache, string label)
     {
         if (cache.TryGetValue(imageIndex, out StaticTexture2D cached))
         {
@@ -147,14 +307,14 @@ internal static class MaterialTuner
         }
         catch (Exception ex)
         {
-            UniLog.Warning($"アウトラインマスク画像の取り込みに失敗しました (image {imageIndex}): {ex.Message}");
+            UniLog.Warning($"テクスチャの取り込みに失敗しました ({label}, image {imageIndex}): {ex.Message}");
         }
         await default(ToWorld);
         if (uri == null)
         {
             return null;
         }
-        Slot textureSlot = assetsSlot.AddSlot($"OutlineMask {imageIndex}");
+        Slot textureSlot = assetsSlot.AddSlot($"{label} {imageIndex}");
         StaticTexture2D texture = textureSlot.AttachComponent<StaticTexture2D>();
         texture.URL.Value = uri;
         cache[imageIndex] = texture;
