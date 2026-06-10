@@ -7,6 +7,23 @@ using VrmToResonitePackage.Vrm;
 
 namespace VrmToResonitePackage;
 
+/// <summary>Tunable knobs for the avatar setup; defaults match typical VRM avatars.</summary>
+internal sealed class AvatarSetupOptions
+{
+    public float? TargetHeight { get; set; }
+    public bool FaceTracking { get; set; }
+    public bool Protect { get; set; } = true;
+
+    /// <summary>View offset forward from the eye midpoint, in meters. Null = auto (eye-distance scaled).</summary>
+    public float? ViewForward { get; set; }
+
+    /// <summary>View offset upward from the eye midpoint, in meters. Null = auto (eye-distance scaled).</summary>
+    public float? ViewUp { get; set; }
+
+    /// <summary>AvatarRenderSettings near clip distance. Zero or negative disables the override.</summary>
+    public float NearClip { get; set; } = 0.075f;
+}
+
 /// <summary>
 /// Headless replication of Resonite's in-game avatar creation (AvatarCreator.RunCreate),
 /// driven by the exact humanoid/expression data from the VRM file instead of in-world
@@ -74,8 +91,7 @@ internal static class AvatarSetup
         ["rightLittleDistal"] = BodyNode.RightPinky_Distal,
     };
 
-    public static void Build(Slot root, VrmModel vrm, float? targetHeight, bool setupFaceTracking = false,
-        bool protect = true)
+    public static void Build(Slot root, VrmModel vrm, AvatarSetupOptions options)
     {
         Dictionary<string, Slot> slotsByName = SlotIndex.Build(root);
 
@@ -86,15 +102,15 @@ internal static class AvatarSetup
             return;
         }
 
-        if (targetHeight.HasValue)
+        if (options.TargetHeight.HasValue)
         {
             BoundingBox bounds = root.ComputeBoundingBox();
             float currentHeight = bounds.Size.y;
             if (currentHeight > 0.01f)
             {
-                float factor = targetHeight.Value / currentHeight;
+                float factor = options.TargetHeight.Value / currentHeight;
                 root.LocalScale *= factor;
-                UniLog.Log($"身長 {currentHeight:F3}m -> {targetHeight.Value:F3}m にリスケール (x{factor:F3})");
+                UniLog.Log($"身長 {currentHeight:F3}m -> {options.TargetHeight.Value:F3}m にリスケール (x{factor:F3})");
             }
         }
 
@@ -116,7 +132,7 @@ internal static class AvatarSetup
         try
         {
             Slot headsetRef = refs.AddSlot("Headset");
-            headsetRef.GlobalPosition = ComputeEyePosition(rig, vrm, up, forward);
+            headsetRef.GlobalPosition = ComputeEyePosition(rig, vrm, up, forward, options);
             headsetRef.GlobalRotation = floatQ.LookRotation(forward, up);
 
             Slot leftRef = refs.AddSlot("LeftHand");
@@ -160,7 +176,7 @@ internal static class AvatarSetup
         root.AttachComponent<AvatarRoot>();
         grabbable.CustomCanGrabCheck.Target = Grabbable.UserRootGrabCheck;
 
-        if (protect)
+        if (options.Protect)
         {
             // Headless there is no signed-in user, but ReassignUserOnPackageImport
             // (default true) hands ownership to whoever imports the package in Resonite.
@@ -171,16 +187,19 @@ internal static class AvatarSetup
             }
         }
 
-        // Pull the near clip in so long bangs don't occlude the first-person view.
-        Slot renderSettingsSlot = root.AddSlot("AvatarRenderSettings");
-        AvatarRenderSettings renderSettings = renderSettingsSlot.AttachComponent<AvatarRenderSettings>();
-        renderSettings.NearClip.Value = 0.075f;
-        renderSettings.FarClip.Value = null;
+        if (options.NearClip > 0f)
+        {
+            // Pull the near clip in so long bangs don't occlude the first-person view.
+            Slot renderSettingsSlot = root.AddSlot("AvatarRenderSettings");
+            AvatarRenderSettings renderSettings = renderSettingsSlot.AttachComponent<AvatarRenderSettings>();
+            renderSettings.NearClip.Value = options.NearClip;
+            renderSettings.FarClip.Value = null;
+        }
 
         AvatarCreator.EnsureVoiceOutput(root, rig, volumeMeter: true);
         HashSet<IField<float>> vrmVisemeFields = SetupVisemesFromVrm(root, vrm);
         CleanupMisassignedVisemes(root, vrmVisemeFields);
-        if (setupFaceTracking)
+        if (options.FaceTracking)
         {
             AvatarCreator.TrySetupFaceTracking(root);
         }
@@ -236,9 +255,10 @@ internal static class AvatarSetup
     /// Computes the first-person view position. The raw eye-bone midpoint sits inside
     /// the face mesh, so the view is pushed out to roughly the glabella (between the
     /// eyebrows, on the face surface) — the common convention for Resonite avatars.
-    /// The offsets scale with the distance between the eye bones.
+    /// The offsets scale with the distance between the eye bones unless overridden.
     /// </summary>
-    private static float3 ComputeEyePosition(BipedRig rig, VrmModel vrm, float3 up, float3 forward)
+    private static float3 ComputeEyePosition(BipedRig rig, VrmModel vrm, float3 up, float3 forward,
+        AvatarSetupOptions options)
     {
         Slot leftEye = rig.TryGetBone(BodyNode.LeftEye);
         Slot rightEye = rig.TryGetBone(BodyNode.RightEye);
@@ -246,8 +266,8 @@ internal static class AvatarSetup
         {
             float3 eyeMid = (leftEye.GlobalPosition + rightEye.GlobalPosition) * 0.5f;
             float eyeDistance = MathX.Distance(leftEye.GlobalPosition, rightEye.GlobalPosition);
-            float forwardOffset = MathX.Clamp(eyeDistance * 0.7f, 0.03f, 0.09f);
-            float upOffset = MathX.Clamp(eyeDistance * 0.2f, 0.005f, 0.025f);
+            float forwardOffset = options.ViewForward ?? MathX.Clamp(eyeDistance * 0.7f, 0.03f, 0.09f);
+            float upOffset = options.ViewUp ?? MathX.Clamp(eyeDistance * 0.2f, 0.005f, 0.025f);
             return eyeMid + forward * forwardOffset + up * upOffset;
         }
 
@@ -265,7 +285,9 @@ internal static class AvatarSetup
         {
             basePosition = head.GlobalPosition + up * 0.06f * scale;
         }
-        return basePosition + forward * 0.06f * scale + up * 0.01f * scale;
+        return basePosition
+               + forward * (options.ViewForward ?? 0.06f * scale)
+               + up * (options.ViewUp ?? 0.01f * scale);
     }
 
     /// <summary>

@@ -131,6 +131,9 @@ internal sealed class CliOptions
     public bool NoProtection { get; set; }
     public bool KeepWorkingFiles { get; set; }
     public float? TargetHeight { get; set; }
+    public float? ViewForward { get; set; }
+    public float? ViewUp { get; set; }
+    public float? NearClip { get; set; }
     public bool InspectMode { get; set; }
     public bool InspectVerbose { get; set; }
 
@@ -174,13 +177,16 @@ internal sealed class CliOptions
                     options.KeepWorkingFiles = true;
                     break;
                 case "--height":
-                    string heightText = RequireValue(args, ref i, arg);
-                    if (!float.TryParse(heightText, System.Globalization.NumberStyles.Float,
-                            System.Globalization.CultureInfo.InvariantCulture, out float height) || height <= 0f)
-                    {
-                        throw new ArgumentException($"--height の値が不正です: {heightText}");
-                    }
-                    options.TargetHeight = height;
+                    options.TargetHeight = RequireFloat(args, ref i, arg, mustBePositive: true);
+                    break;
+                case "--view-forward":
+                    options.ViewForward = RequireFloat(args, ref i, arg, mustBePositive: false);
+                    break;
+                case "--view-up":
+                    options.ViewUp = RequireFloat(args, ref i, arg, mustBePositive: false);
+                    break;
+                case "--near-clip":
+                    options.NearClip = RequireFloat(args, ref i, arg, mustBePositive: false);
                     break;
                 default:
                     if (arg.StartsWith('-'))
@@ -208,6 +214,18 @@ internal sealed class CliOptions
         return args[index];
     }
 
+    private static float RequireFloat(string[] args, ref int index, string name, bool mustBePositive)
+    {
+        string text = RequireValue(args, ref index, name);
+        if (!float.TryParse(text, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float value) ||
+            (mustBePositive && value <= 0f))
+        {
+            throw new ArgumentException($"{name} の値が不正です: {text}");
+        }
+        return value;
+    }
+
     public static void PrintUsage()
     {
         Console.WriteLine("使い方:");
@@ -223,6 +241,9 @@ internal sealed class CliOptions
         Console.WriteLine("  --face-tracking          フェイストラッキング用AvatarExpressionDriverを生成");
         Console.WriteLine("  --no-protection          SimpleAvatarProtection（アバター保護）を付けない");
         Console.WriteLine("  --height <m>             アバターの身長をメートル指定でリスケール");
+        Console.WriteLine("  --view-forward <m>       視点の前方オフセット（既定: 目間距離から自動）");
+        Console.WriteLine("  --view-up <m>            視点の上方オフセット（既定: 目間距離から自動)");
+        Console.WriteLine("  --near-clip <m>          AvatarRenderSettingsのNearClip（既定: 0.075、0で無効）");
         Console.WriteLine("  --keep-working-files     作業用一時ファイルを残す（デバッグ用）");
         Console.WriteLine("  -h, --help               このヘルプ");
         Console.WriteLine();

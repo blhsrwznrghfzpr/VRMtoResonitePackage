@@ -55,6 +55,12 @@ VrmToResonitePackage.exe <model.vrm> [model2.vrm ...] [オプション]
   --no-protection          SimpleAvatarProtection（アバター保護）を付けない
                            （既定で付与。インポートした人が所有者になる）
   --height <m>             アバターの身長をメートル指定でリスケール
+  --view-forward <m>       視点（眉間）の前方オフセットをメートルで指定
+                           （既定: 目ボーン間距離から自動計算、約0.03〜0.09）
+  --view-up <m>            視点の上方オフセットをメートルで指定
+                           （既定: 目ボーン間距離から自動計算、約0.005〜0.025）
+  --near-clip <m>          AvatarRenderSettingsのNearClip値
+                           （既定: 0.075。0を指定するとコンポーネント自体を付けない）
   --keep-working-files     作業用一時ファイルを残す（デバッグ用）
   --inspect                変換せず、.resonitepackageの中身を表示（検証用）
   -h, --help               ヘルプ
