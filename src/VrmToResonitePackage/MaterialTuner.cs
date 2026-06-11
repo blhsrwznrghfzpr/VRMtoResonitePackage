@@ -101,14 +101,22 @@ internal static class MaterialTuner
         material.UseVertexColors.Value = false;
 
         // --- Rim lighting ---
+        // MToon: pow(saturate(1 - N·V + lift), power) — a smooth power falloff.
+        // XiexeToon: smoothstep(range - sharpness, range + sharpness, 1 - N·V),
+        // with RimThreshold being an N·L exponent (lit-side gating) MToon doesn't have.
+        // Center the smoothstep band on MToon's half-intensity point and match the
+        // falloff slope there so the rim width and softness line up.
         System.Numerics.Vector4 rim = info.RimColor;
+        float fresnelPower = MathX.Max(info.RimFresnelPower, 0.001f);
+        float halfPoint = MathF.Pow(0.5f, 1f / fresnelPower);
+        float slope = fresnelPower * MathF.Pow(0.5f, (fresnelPower - 1f) / fresnelPower);
         material.RimColor.Value = new colorX(rim.X, rim.Y, rim.Z, 1f);
         material.RimAlbedoTint.Value = 0f;
         material.RimAttenuationEffect.Value = info.RimLightingMix;
         material.RimIntensity.Value = MathX.Max(rim.X, rim.Y, rim.Z);
-        material.RimRange.Value = 1f / MathX.Max(info.RimFresnelPower, 0.001f);
-        material.RimThreshold.Value = info.RimLift;
-        material.RimSharpness.Value = 0.5f;
+        material.RimRange.Value = MathX.Clamp01(halfPoint - info.RimLift);
+        material.RimThreshold.Value = 0f;
+        material.RimSharpness.Value = MathX.Clamp(0.75f / slope, 0.01f, 1f);
 
         // --- Emission ---
         if (info.EmissionColor.HasValue)
