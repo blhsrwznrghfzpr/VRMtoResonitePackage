@@ -9,6 +9,13 @@ public sealed class VrmModel
     /// <summary>"0" or "1" (major spec version).</summary>
     public int SpecVersionMajor { get; set; }
 
+    /// <summary>
+    /// True when <see cref="GlbPreprocessor.CreateImportableGlb"/> baked a Y180 rotation
+    /// into the VRM0 glTF so the imported model faces +Z (engine space == Unity space).
+    /// Only ever set for VRM0; VRM1 always leaves this false.
+    /// </summary>
+    public bool OrientationBaked { get; set; }
+
     public string Title { get; set; }
     public string Author { get; set; }
 

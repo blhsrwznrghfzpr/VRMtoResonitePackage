@@ -330,12 +330,12 @@ internal static class SpringBoneSetup
                 return result;
             }
             // Resonite's sphere collider has no offset field; the slot position is the offset.
-            float3 offset = ConvertVector(collider.Offset, vrm.SpecVersionMajor);
+            float3 offset = ConvertVector(collider.Offset, vrm);
             result.Add(CreateSphere(slot, offset, collider.Radius));
             if (collider.Tail.HasValue)
             {
                 // VRM1 capsule: approximate with extra spheres along the capsule axis.
-                float3 tail = ConvertVector(collider.Tail.Value, vrm.SpecVersionMajor);
+                float3 tail = ConvertVector(collider.Tail.Value, vrm);
                 float3 axis = tail - offset;
                 int segments = MathX.Clamp((int)MathX.Ceil(axis.Magnitude / MathX.Max(collider.Radius, 0.01f)), 1, 4);
                 for (int i = 1; i <= segments; i++)
@@ -367,14 +367,28 @@ internal static class SpringBoneSetup
         }
 
         /// <summary>
-        /// VRM0 stores spring data in Unity coordinates (UniVRM flips X on export),
-        /// VRM1 stores glTF coordinates which Resonite's importer reads numerically as-is.
+        /// Converts a VRM collider offset (stored in the VRM's native coordinates) into the
+        /// engine slot-local space, matching how the model itself ends up oriented.
+        ///
+        /// Resonite's ModelImporter mirrors the whole scene by scale(-1,1,1) (RH->LH), so the
+        /// engine's slot-local value is always the glTF-node-local value with X flipped.
+        /// - VRM1: VRMC_springBone offsets are glTF-node-local already, so apply only that X
+        ///   flip: (-x, y, z).
+        /// - VRM0 with the orientation baked to +Z: the bake (Y180) composed with the importer's
+        ///   X mirror and UniVRM's ReverseZ export collapses to identity, so the engine sees raw
+        ///   Unity coordinates. VRM0 offsets are Unity values, so pass them through: (x, y, z).
+        /// - VRM0 without the bake (fallback): only FlipX∘ReverseZ applies, mapping the Unity
+        ///   offset to (-x, y, -z).
         /// </summary>
-        private static float3 ConvertVector(System.Numerics.Vector3 v, int specVersionMajor)
+        private static float3 ConvertVector(System.Numerics.Vector3 v, VrmModel vrm)
         {
-            return specVersionMajor == 0
-                ? new float3(-v.X, v.Y, v.Z)
-                : new float3(v.X, v.Y, v.Z);
+            if (vrm.SpecVersionMajor != 0)
+            {
+                return new float3(-v.X, v.Y, v.Z);
+            }
+            return vrm.OrientationBaked
+                ? new float3(v.X, v.Y, v.Z)
+                : new float3(-v.X, v.Y, -v.Z);
         }
     }
 }

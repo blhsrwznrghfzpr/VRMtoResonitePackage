@@ -1,3 +1,4 @@
+using Elements.Core;
 using System.Text;
 using System.Text.Json.Nodes;
 
@@ -21,9 +22,14 @@ internal static class GlbPreprocessor
 {
     private const uint GlbMagic = 0x46546C67;   // "glTF"
     private const uint JsonChunkType = 0x4E4F534A; // "JSON"
+    private const uint BinChunkType = 0x004E4942; // "BIN\0"
 
-    /// <summary>Copies the VRM to <paramref name="targetPath"/> as an import-ready GLB.</summary>
-    public static void CreateImportableGlb(string sourcePath, string targetPath)
+    /// <summary>
+    /// Copies the VRM to <paramref name="targetPath"/> as an import-ready GLB.
+    /// Returns true when a Y180 orientation bake was applied (VRM0 only), which the caller
+    /// records on the <see cref="VrmModel"/> so collider offsets are converted correctly.
+    /// </summary>
+    public static bool CreateImportableGlb(string sourcePath, string targetPath)
     {
         byte[] data = File.ReadAllBytes(sourcePath);
         if (data.Length < 12 || BitConverter.ToUInt32(data, 0) != GlbMagic)
@@ -50,17 +56,28 @@ internal static class GlbPreprocessor
         }
         (uint _, int jsonOffset, int jsonLength) = chunks[jsonIndex];
 
+        int binIndex = chunks.FindIndex(c => c.type == BinChunkType);
+        int binOffset = binIndex >= 0 ? chunks[binIndex].offset : -1;
+        int binLength = binIndex >= 0 ? chunks[binIndex].length : 0;
+
         JsonNode root = JsonNode.Parse(new ReadOnlySpan<byte>(data, jsonOffset, jsonLength));
         bool changed = false;
+        bool baked = false;
         if (root != null)
         {
             changed |= FixTargetNames(root);
             changed |= FixMorphTargetAttributes(root);
+            // VRM0 imports facing -Z, which forces VRIK to spin CenteredRoot 180°. Baking a
+            // Y180 (origin-centered) into the glTF makes the imported model face +Z with a
+            // zero CenteredRoot rotation. Combined with the importer's X mirror and UniVRM's
+            // ReverseZ export this collapses to identity, so engine space becomes Unity space.
+            baked = BakeVrm0Y180(root, data, binOffset, binLength);
+            changed |= baked;
         }
         if (!changed)
         {
             File.Copy(sourcePath, targetPath, overwrite: true);
-            return;
+            return false;
         }
 
         // Re-encode the JSON chunk, padded with spaces to 4-byte alignment per spec.
@@ -99,6 +116,7 @@ internal static class GlbPreprocessor
             writer.Write(type);
             writer.Write(data, offset, length);
         }
+        return baked;
     }
 
     /// <summary>Returns true when the JSON was modified.</summary>
@@ -261,6 +279,181 @@ internal static class GlbPreprocessor
             }
         }
         return changed;
+    }
+
+    /// <summary>
+    /// Bakes a Y180 rotation R = diag(-1, 1, -1) (origin-centered) into a VRM0 glTF so the
+    /// imported model faces +Z. Only safe — and only applied — when the file is a normalized,
+    /// rotation-free VRM0; otherwise logs a warning and skips.
+    ///
+    /// Math: in a hierarchy with no node rotations, every joint's world transform is just its
+    /// world translation T(p). Applying R to every node translation moves jointWorld to R·p,
+    /// and left-multiplying each inverse bind matrix by R (IBM' = R·IBM) makes the skinned
+    /// vertex world coordinates exactly R·(original world coordinate). Vertex, normal and morph
+    /// data need no change. Returns true when the bake was applied.
+    /// </summary>
+    private static bool BakeVrm0Y180(JsonNode root, byte[] data, int binOffset, int binLength)
+    {
+        if (root["extensions"] is not JsonObject extensions || extensions["VRM"] == null)
+        {
+            return false; // Not VRM0 — bake is VRM0-specific.
+        }
+
+        if (!CanBakeVrm0(root, out string reason))
+        {
+            UniLog.Warning($"VRM0の向き正規化をスキップしました（{reason}）。");
+            return false;
+        }
+
+        // 1) Mirror translations: [x, y, z] -> [-x, y, -z].
+        if (root["nodes"] is JsonArray nodes)
+        {
+            foreach (JsonNode nodeNode in nodes)
+            {
+                if (nodeNode is JsonObject node && node["translation"] is JsonArray t && t.Count == 3)
+                {
+                    t[0] = JsonValue.Create(-t[0].GetValue<float>());
+                    t[2] = JsonValue.Create(-t[2].GetValue<float>());
+                }
+            }
+        }
+
+        // 2) Left-multiply each skin's inverseBindMatrices by R. glTF mat4 is column-major,
+        //    so R = diag(-1,1,-1) negates rows 0 and 2 = column-major indices 0,4,8,12 and
+        //    2,6,10,14. Edit the float群 in place in the binary chunk.
+        if (root["skins"] is JsonArray skins)
+        {
+            JsonArray accessors = root["accessors"] as JsonArray;
+            JsonArray bufferViews = root["bufferViews"] as JsonArray;
+            foreach (JsonNode skinNode in skins)
+            {
+                if (skinNode is not JsonObject skin ||
+                    skin["inverseBindMatrices"] is not JsonValue ibmRef)
+                {
+                    continue;
+                }
+                int accessorIndex = ibmRef.GetValue<int>();
+                JsonObject accessor = accessors?[accessorIndex] as JsonObject;
+                int count = accessor?["count"]?.GetValue<int>() ?? 0;
+                int bufferViewIndex = accessor?["bufferView"]?.GetValue<int>() ?? -1;
+                int accessorByteOffset = accessor?["byteOffset"]?.GetValue<int>() ?? 0;
+                JsonObject bufferView = bufferViewIndex >= 0 ? bufferViews?[bufferViewIndex] as JsonObject : null;
+                int bufferViewByteOffset = bufferView?["byteOffset"]?.GetValue<int>() ?? 0;
+                if (count <= 0 || bufferView == null || binOffset < 0)
+                {
+                    continue;
+                }
+
+                int matStart = binOffset + bufferViewByteOffset + accessorByteOffset;
+                for (int m = 0; m < count; m++)
+                {
+                    int baseOffset = matStart + m * 64; // 16 floats * 4 bytes
+                    foreach (int floatIndex in new[] { 0, 4, 8, 12, 2, 6, 10, 14 })
+                    {
+                        int byteIndex = baseOffset + floatIndex * 4;
+                        float value = BitConverter.ToSingle(data, byteIndex);
+                        BitConverter.GetBytes(-value).CopyTo(data, byteIndex);
+                    }
+                }
+            }
+        }
+
+        UniLog.Log("VRM0の向きを+Zに正規化しました（CenteredRoot回転0）。");
+        return true;
+    }
+
+    /// <summary>
+    /// Verifies the strict preconditions under which the Y180 bake's "rotation-free hierarchy"
+    /// math holds. Sets <paramref name="reason"/> to a Japanese explanation when it does not.
+    /// </summary>
+    private static bool CanBakeVrm0(JsonNode root, out string reason)
+    {
+        // Animations would be baked against the old orientation.
+        if (root["animations"] is JsonArray animations && animations.Count > 0)
+        {
+            reason = "アニメーションを含むため";
+            return false;
+        }
+
+        if (root["nodes"] is JsonArray nodes)
+        {
+            foreach (JsonNode nodeNode in nodes)
+            {
+                if (nodeNode is not JsonObject node)
+                {
+                    continue;
+                }
+                // A node matrix would not compose cleanly with our translation/IBM edit.
+                if (node["matrix"] != null)
+                {
+                    reason = "ノードにmatrixが指定されているため";
+                    return false;
+                }
+                // The math assumes every node rotation is identity.
+                if (node["rotation"] is JsonArray rotation && rotation.Count == 4)
+                {
+                    if (MathX.Abs(rotation[0].GetValue<float>()) >= 1e-4f ||
+                        MathX.Abs(rotation[1].GetValue<float>()) >= 1e-4f ||
+                        MathX.Abs(rotation[2].GetValue<float>()) >= 1e-4f)
+                    {
+                        reason = "ノードに非ゼロ回転があるため";
+                        return false;
+                    }
+                }
+                // A mesh node without a skin has un-rotated vertices; the bake would not turn them.
+                if (node["mesh"] != null && node["skin"] == null)
+                {
+                    reason = "スキンを持たないメッシュノードがあるため";
+                    return false;
+                }
+            }
+        }
+
+        // Every skin's IBM accessor must be a plain float MAT4 (no sparse) so the in-place
+        // binary edit applies cleanly.
+        JsonArray accessors = root["accessors"] as JsonArray;
+        if (root["skins"] is JsonArray skins)
+        {
+            foreach (JsonNode skinNode in skins)
+            {
+                if (skinNode is not JsonObject skin)
+                {
+                    continue;
+                }
+                if (skin["inverseBindMatrices"] is not JsonValue ibmRef)
+                {
+                    reason = "skinにinverseBindMatricesが無いため";
+                    return false;
+                }
+                int accessorIndex = ibmRef.GetValue<int>();
+                if (accessors?[accessorIndex] is not JsonObject accessor)
+                {
+                    reason = "inverseBindMatricesのaccessorが見つからないため";
+                    return false;
+                }
+                int componentType = accessor["componentType"]?.GetValue<int>() ?? 0;
+                string type = accessor["type"]?.GetValue<string>();
+                if (componentType != 5126 || type != "MAT4" || accessor["sparse"] != null)
+                {
+                    reason = "inverseBindMatricesがfloat MAT4(非sparse)でないため";
+                    return false;
+                }
+                // A byteStride other than the tight 64-byte mat4 size would break the in-place
+                // packing assumption (the spec allows interleaving, though MAT4 IBMs never do).
+                int bufferViewIndex = accessor["bufferView"]?.GetValue<int>() ?? -1;
+                JsonObject bufferView = bufferViewIndex >= 0
+                    ? (root["bufferViews"] as JsonArray)?[bufferViewIndex] as JsonObject : null;
+                int byteStride = bufferView?["byteStride"]?.GetValue<int>() ?? 0;
+                if (byteStride != 0 && byteStride != 64)
+                {
+                    reason = "inverseBindMatricesにbyteStrideが指定されているため";
+                    return false;
+                }
+            }
+        }
+
+        reason = null;
+        return true;
     }
 
     private static List<string> ReadNames(JsonNode extras)

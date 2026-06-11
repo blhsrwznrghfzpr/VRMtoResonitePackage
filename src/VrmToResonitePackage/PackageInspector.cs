@@ -130,14 +130,27 @@ internal static class PackageInspector
     {
         var chains = new List<(string slotName, string templateName, List<string> bindings, int colliders)>();
         var templates = new List<string>();
+        var colliderSlots = new List<(string parent, float[] pos)>();
+        var transformNotes = new List<string>();
         bool sawSpace = false;
         bool sawSettingsRoot = false;
 
-        void Walk(DataTreeDictionary slot)
+        void Walk(DataTreeDictionary slot, string parentName)
         {
             string name = ExtractField<string>(slot.TryGetNode("Name")) ?? "(unnamed)";
             string tag = ExtractField<string>(slot.TryGetNode("Tag"));
             var componentTypes = ComponentTypeNames(slot, typeNames);
+
+            if (name == "VRM Collider")
+            {
+                colliderSlots.Add((parentName, ExtractFloats(slot.TryGetNode("Position"))));
+            }
+            if (name is "CenteredRoot" or "Root" || name.EndsWith("_L_Hand") || name == "LeftHand")
+            {
+                float[] rot = ExtractFloats(slot.TryGetNode("Rotation"));
+                float[] pos = ExtractFloats(slot.TryGetNode("Position"));
+                transformNotes.Add($"{parentName}/{name}: pos={FormatVec(pos)} rot={FormatVec(rot)}");
+            }
 
             if (componentTypes.Any(t => t.Contains("DynamicVariableSpace")))
             {
@@ -201,13 +214,13 @@ internal static class PackageInspector
                 {
                     if (child is DataTreeDictionary cd)
                     {
-                        Walk(cd);
+                        Walk(cd, name);
                     }
                 }
             }
         }
 
-        Walk(objectRoot);
+        Walk(objectRoot, "");
 
         if (!sawSpace && chains.Count == 0 && templates.Count == 0)
         {
@@ -224,6 +237,38 @@ internal static class PackageInspector
         {
             Console.WriteLine($"    - {slotName}: template={templateName ?? "?"}, bindings={bindings.Count}, colliders={colliders}");
         }
+        Console.WriteLine($"  コライダースロット ({colliderSlots.Count}):");
+        foreach ((string parent, float[] pos) in colliderSlots)
+        {
+            Console.WriteLine($"    - {parent}: localPos={FormatVec(pos)}");
+        }
+        Console.WriteLine("  主要トランスフォーム:");
+        foreach (string note in transformNotes)
+        {
+            Console.WriteLine($"    - {note}");
+        }
+    }
+
+    private static float[] ExtractFloats(DataTreeNode node)
+    {
+        if (node is DataTreeDictionary dict)
+        {
+            node = dict.TryGetNode("Data");
+        }
+        if (node is DataTreeList list)
+        {
+            return list.Children.Select(c =>
+            {
+                try { return (c as DataTreeValue)?.Extract<float>() ?? 0f; }
+                catch { return 0f; }
+            }).ToArray();
+        }
+        return null;
+    }
+
+    private static string FormatVec(float[] v)
+    {
+        return v == null ? "?" : "(" + string.Join(", ", v.Select(f => f.ToString("+0.0000;-0.0000"))) + ")";
     }
 
     private static List<string> ComponentTypeNames(DataTreeDictionary slot, List<string> typeNames)
