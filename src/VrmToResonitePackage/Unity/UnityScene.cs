@@ -49,6 +49,9 @@ public sealed class UnityScene
     public IEnumerable<YamlDocument> SkinnedMeshRenderers =>
         _byFileId.Values.Where(d => d.ClassId == ClassSkinnedMeshRenderer);
 
+    public IEnumerable<YamlDocument> MonoBehaviours =>
+        _byFileId.Values.Where(d => d.ClassId == ClassMonoBehaviour);
+
     public int GameObjectCount => GameObjects.Count();
 
     public string GameObjectName(long gameObjectFileId) => Doc(gameObjectFileId)?.Root?["m_Name"]?.AsString();
@@ -151,6 +154,36 @@ public sealed class UnityScene
     {
         long go = component?.Root?["m_GameObject"]?.FileID ?? 0;
         return Doc(go);
+    }
+
+    /// <summary>
+    /// All GameObject fileIds in the transform subtree rooted at the given GameObject (inclusive).
+    /// Used to scope parsing to one avatar when a scene/prefab contains more than the avatar.
+    /// </summary>
+    public HashSet<long> SubtreeGameObjectIds(long rootGameObjectFileId)
+    {
+        var result = new HashSet<long>();
+        void Walk(long gameObjectFileId)
+        {
+            if (gameObjectFileId == 0 || !result.Add(gameObjectFileId))
+            {
+                return;
+            }
+            YamlDocument transform = TransformOfGameObject(gameObjectFileId);
+            YamlNode children = transform?.Root?["m_Children"];
+            if (children?.Seq == null)
+            {
+                return;
+            }
+            foreach (YamlNode child in children.Seq)
+            {
+                YamlDocument childTransform = Doc(child?.FileID ?? 0);
+                long childGo = childTransform?.Root?["m_GameObject"]?.FileID ?? 0;
+                Walk(childGo);
+            }
+        }
+        Walk(rootGameObjectFileId);
+        return result;
     }
 
     /// <summary>Local position/rotation/scale of a GameObject's Transform, plus its parent GameObject name.</summary>

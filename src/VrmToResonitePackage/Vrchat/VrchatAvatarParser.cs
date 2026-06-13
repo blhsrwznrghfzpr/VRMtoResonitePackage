@@ -15,16 +15,17 @@ public static class VrchatAvatarParser
 {
     private sealed class Candidate
     {
-        public UnityAsset Prefab;
+        public UnityAsset Source;        // the .prefab or .unity file the avatar was found in
         public UnityScene Scene;
-        public YamlDocument Root;       // root GameObject
-        public YamlDocument Descriptor; // VRCAvatarDescriptor MonoBehaviour
-        public int Size;                // GameObject count (hierarchy size)
+        public YamlDocument Root;        // avatar root GameObject (the descriptor's GameObject)
+        public YamlDocument Descriptor;  // VRCAvatarDescriptor MonoBehaviour
+        public HashSet<long> Subtree;    // GameObject fileIds belonging to this avatar
+        public int Size => Subtree?.Count ?? 0;
     }
 
     /// <summary>
     /// Parses the primary avatar. <paramref name="avatarOverride"/> selects a specific avatar by
-    /// prefab/root name (case-insensitive, substring) when the package holds more than one.
+    /// root/file name (case-insensitive, substring) when the package holds more than one.
     /// </summary>
     public static VrchatAvatar Parse(UnityPackage package, string avatarOverride = null)
     {
@@ -32,35 +33,41 @@ public static class VrchatAvatarParser
         if (candidates.Count == 0)
         {
             throw new InvalidDataException(
-                "VRCAvatarDescriptor を持つアバターのprefabが見つかりませんでした。VRChatアバターのUnityPackageか確認してください。");
+                "VRCAvatarDescriptor を持つアバターが見つかりませんでした。VRChatアバターのUnityPackageか確認してください。" +
+                "（prefab/シーンを走査しましたが、VRCAvatarDescriptorコンポーネントを検出できませんでした）");
         }
 
         Candidate selected = SelectPrimary(candidates, avatarOverride);
         foreach (Candidate c in candidates.OrderByDescending(c => c.Size))
         {
             string mark = c == selected ? "=> 選択" : "   スキップ";
-            UniLog.Log($"VRChatアバター候補 {mark}: {Path.GetFileName(c.Prefab.LogicalPath)} (GameObject {c.Size})");
+            string name = c.Scene.GameObjectName(c.Root.FileId) ?? "?";
+            UniLog.Log($"VRChatアバター候補 {mark}: {name} ({Path.GetFileName(c.Source.LogicalPath)}, GameObject {c.Size})");
         }
 
         var avatar = new VrchatAvatar
         {
-            Name = selected.Scene.GameObjectName(selected.Root.FileId) ?? Path.GetFileNameWithoutExtension(selected.Prefab.LogicalPath),
-            PrefabPath = selected.Prefab.LogicalPath,
+            Name = selected.Scene.GameObjectName(selected.Root.FileId) ?? Path.GetFileNameWithoutExtension(selected.Source.LogicalPath),
+            PrefabPath = selected.Source.LogicalPath,
         };
 
-        ResolveFbx(package, selected.Scene, avatar);
+        ResolveFbx(package, selected.Scene, selected.Subtree, avatar);
         ParseHumanoid(package, avatar);
         ParseDescriptor(selected.Scene, selected.Descriptor, avatar);
-        ParsePhysBones(selected.Scene, avatar);
-        ParseRendererMaterials(selected.Scene, avatar);
-        ParseInactiveGameObjects(selected.Scene, avatar);
+        ParsePhysBones(selected.Scene, selected.Subtree, avatar);
+        ParseRendererMaterials(selected.Scene, selected.Subtree, avatar);
+        ParseInactiveGameObjects(selected.Scene, selected.Subtree, avatar);
         return avatar;
     }
 
-    private static void ParseInactiveGameObjects(UnityScene scene, VrchatAvatar avatar)
+    private static void ParseInactiveGameObjects(UnityScene scene, HashSet<long> subtree, VrchatAvatar avatar)
     {
         foreach (YamlDocument go in scene.GameObjects)
         {
+            if (!subtree.Contains(go.FileId))
+            {
+                continue;
+            }
             if ((go.Root?["m_IsActive"]?.AsInt(1) ?? 1) == 0)
             {
                 string name = go.Root?["m_Name"]?.AsString();
@@ -81,13 +88,21 @@ public static class VrchatAvatarParser
     private static List<Candidate> FindCandidates(UnityPackage package)
     {
         var candidates = new List<Candidate>();
-        foreach (UnityAsset prefab in package.ByExtension(".prefab"))
+        int scanned = 0;
+        // VRChat avatars normally ship as a .prefab, but some packages place the avatar in a .unity
+        // scene; scan both. The descriptor may sit on the file root, on a nested GameObject, or be
+        // inline in a prefab variant — find it by component, not by requiring a root match. It is
+        // detected by script GUID or, GUID-independently, by its characteristic field signature.
+        foreach (UnityAsset source in package.ByExtension(".prefab").Concat(package.ByExtension(".unity")))
         {
-            string text = package.ReadText(prefab);
-            if (text == null || !text.Contains(VrchatConstants.AvatarDescriptorScriptGuid, StringComparison.Ordinal))
+            string text = package.ReadText(source);
+            if (text == null ||
+                !(text.Contains(VrchatConstants.AvatarDescriptorScriptGuid, StringComparison.Ordinal) ||
+                  text.Contains("baseAnimationLayers", StringComparison.Ordinal)))
             {
                 continue;
             }
+            scanned++;
             UnityScene scene;
             try
             {
@@ -95,31 +110,47 @@ public static class VrchatAvatarParser
             }
             catch (Exception ex)
             {
-                UniLog.Warning($"prefab の解析に失敗しました ({prefab.LogicalPath}): {ex.Message}");
+                UniLog.Warning($"ファイルの解析に失敗しました ({source.LogicalPath}): {ex.Message}");
                 continue;
             }
-            foreach (YamlDocument root in scene.RootGameObjects())
+            foreach (YamlDocument descriptor in scene.MonoBehaviours.Where(IsAvatarDescriptor))
             {
-                // Skip prefab-variant roots (they reference a source object and only carry overrides).
-                if ((root.Root?["m_CorrespondingSourceObject"]?.FileID ?? 0) != 0)
+                YamlDocument root = scene.OwnerGameObject(descriptor);
+                if (root == null || string.IsNullOrEmpty(scene.GameObjectName(root.FileId)))
                 {
                     continue;
                 }
-                YamlDocument descriptor = scene.FindMonoBehaviour(root, VrchatConstants.AvatarDescriptorScriptGuid);
-                if (descriptor != null)
+                candidates.Add(new Candidate
                 {
-                    candidates.Add(new Candidate
-                    {
-                        Prefab = prefab,
-                        Scene = scene,
-                        Root = root,
-                        Descriptor = descriptor,
-                        Size = scene.GameObjectCount,
-                    });
-                }
+                    Source = source,
+                    Scene = scene,
+                    Root = root,
+                    Descriptor = descriptor,
+                    Subtree = scene.SubtreeGameObjectIds(root.FileId),
+                });
             }
         }
+        if (candidates.Count == 0 && scanned > 0)
+        {
+            UniLog.Warning($"VRCAvatarDescriptorらしきデータは {scanned} 件のファイルに含まれていましたが、" +
+                           "コンポーネントとして解決できませんでした（SDKバージョン差異やprefab構造の可能性）。");
+        }
         return candidates;
+    }
+
+    /// <summary>
+    /// True if a MonoBehaviour is a VRCAvatarDescriptor — either by its known script GUID or, so that
+    /// SDK-version GUID differences still work, by its characteristic serialized field signature.
+    /// </summary>
+    private static bool IsAvatarDescriptor(YamlDocument mono)
+    {
+        if (mono.Root?["m_Script"]?.Guid == VrchatConstants.AvatarDescriptorScriptGuid)
+        {
+            return true;
+        }
+        YamlNode r = mono.Root;
+        return r?["ViewPosition"] != null &&
+               (r["baseAnimationLayers"] != null || r["VisemeBlendShapes"] != null);
     }
 
     private static Candidate SelectPrimary(List<Candidate> candidates, string avatarOverride)
@@ -128,30 +159,38 @@ public static class VrchatAvatarParser
         {
             Candidate match = candidates.FirstOrDefault(c =>
                 (c.Scene.GameObjectName(c.Root.FileId) ?? "").Contains(avatarOverride, StringComparison.OrdinalIgnoreCase) ||
-                Path.GetFileNameWithoutExtension(c.Prefab.LogicalPath).Contains(avatarOverride, StringComparison.OrdinalIgnoreCase));
+                Path.GetFileNameWithoutExtension(c.Source.LogicalPath).Contains(avatarOverride, StringComparison.OrdinalIgnoreCase));
             if (match != null)
             {
                 return match;
             }
             UniLog.Warning($"--avatar '{avatarOverride}' に一致する候補がないため、最大のアバターを使用します。");
         }
-        // Primary = the most complete avatar (largest hierarchy); prefer non-"OLD" prefab folders and
+        // Primary = the most complete avatar (largest hierarchy); prefer non-"OLD" folders and
         // shorter paths so duplicate/legacy copies don't win ties.
         return candidates
             .OrderByDescending(c => c.Size)
-            .ThenBy(c => c.Prefab.LogicalPath.Contains("OLD", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
-            .ThenBy(c => c.Prefab.LogicalPath.Length)
+            .ThenBy(c => c.Source.LogicalPath.Contains("OLD", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+            .ThenBy(c => c.Source.LogicalPath.Length)
             .First();
     }
 
+    /// <summary>True when a component's owning GameObject is part of the selected avatar subtree.</summary>
+    private static bool InSubtree(UnityScene scene, HashSet<long> subtree, YamlDocument component)
+        => subtree.Contains(component?.Root?["m_GameObject"]?.FileID ?? 0);
+
     // ---------------------------------------------------------------- FBX + humanoid
 
-    private static void ResolveFbx(UnityPackage package, UnityScene scene, VrchatAvatar avatar)
+    private static void ResolveFbx(UnityPackage package, UnityScene scene, HashSet<long> subtree, VrchatAvatar avatar)
     {
-        // The humanoid FBX is the mesh referenced by the most skinned renderers.
+        // The humanoid FBX is the mesh referenced by the most skinned renderers (within this avatar).
         var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (YamlDocument smr in scene.SkinnedMeshRenderers)
         {
+            if (!InSubtree(scene, subtree, smr))
+            {
+                continue;
+            }
             string guid = smr.Root?["m_Mesh"]?.Guid;
             if (!string.IsNullOrEmpty(guid))
             {
@@ -266,11 +305,15 @@ public static class VrchatAvatarParser
 
     // ---------------------------------------------------------------- physbones
 
-    private static void ParsePhysBones(UnityScene scene, VrchatAvatar avatar)
+    private static void ParsePhysBones(UnityScene scene, HashSet<long> subtree, VrchatAvatar avatar)
     {
         foreach (YamlDocument pb in scene.MonoBehavioursByScript(
                      VrchatConstants.PhysBoneDllGuid, VrchatConstants.PhysBoneScriptFileId))
         {
+            if (!InSubtree(scene, subtree, pb))
+            {
+                continue;
+            }
             YamlNode r = pb.Root;
             long rootId = r?["rootTransform"]?.FileID ?? 0;
             string rootBone = rootId != 0
@@ -408,10 +451,14 @@ public static class VrchatAvatarParser
 
     // ---------------------------------------------------------------- material assignments
 
-    private static void ParseRendererMaterials(UnityScene scene, VrchatAvatar avatar)
+    private static void ParseRendererMaterials(UnityScene scene, HashSet<long> subtree, VrchatAvatar avatar)
     {
         foreach (YamlDocument smr in scene.SkinnedMeshRenderers)
         {
+            if (!InSubtree(scene, subtree, smr))
+            {
+                continue;
+            }
             string name = scene.ResolveGameObjectName(smr.FileId);
             if (name == null)
             {
