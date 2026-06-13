@@ -277,6 +277,11 @@ internal sealed class MainWindow : Window
     /// </summary>
     private async Task<List<CliOptions>> BuildConversionJobs(string[] inputFiles)
     {
+        // Listing a package's avatars uses Elements.Core (UniLog); the GUI process must resolve
+        // Resonite's assemblies for that to JIT. The CLI path installs this; the GUI doesn't, so
+        // ensure it before parsing (best-effort — if it fails, listing falls back to no dialog).
+        EnsureAssemblyResolver();
+
         var batchFiles = new List<string>();
         var avatarJobs = new List<CliOptions>();
         foreach (string file in inputFiles)
@@ -308,6 +313,26 @@ internal sealed class MainWindow : Window
         }
         jobs.AddRange(avatarJobs);
         return jobs;
+    }
+
+    private bool _resolverInstalled;
+
+    private void EnsureAssemblyResolver()
+    {
+        if (_resolverInstalled)
+        {
+            return;
+        }
+        try
+        {
+            string resonitePath = ResoniteLocator.Locate(_settings.ResonitePath);
+            ResoniteLocator.InstallAssemblyResolver(resonitePath);
+            _resolverInstalled = true;
+        }
+        catch
+        {
+            // No Resonite found yet; avatar listing will fall back to a single auto-selected avatar.
+        }
     }
 
     private static IReadOnlyList<VrchatAvatarChoice> ListPackageAvatars(string path)
