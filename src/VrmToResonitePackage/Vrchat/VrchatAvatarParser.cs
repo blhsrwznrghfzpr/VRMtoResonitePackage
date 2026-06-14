@@ -80,7 +80,7 @@ public static class VrchatAvatarParser
             // Geometry/skeleton come from the FBX the variant sources; the prefab only adds the
             // descriptor. Materials / PhysBones / deletions can't be resolved from the stripped
             // references here, so the avatar imports with rig + visemes + view (bare materials).
-            UniLog.Log($"FBXモデルのPrefab Variantとして処理します（マテリアル/揺れものは未対応）: {selected.Name}");
+            UniLog.Log($"FBXモデルのPrefab Variantとして処理します（基礎マテリアル対応、揺れもの等は制限あり）: {selected.Name}");
             UnityAsset fbx = package.ByGuid(selected.FbxGuidOverride);
             if (fbx?.HasContent != true)
             {
@@ -476,6 +476,7 @@ public static class VrchatAvatarParser
         }
         YamlNode meta = UnityYaml.ParseFlatDocument(File.ReadAllText(fbx.MetaPath));
         ParseFbxImportScale(fbx, meta, avatar);
+        ParseFbxMaterialMappings(meta, avatar);
         YamlNode human = meta["ModelImporter"]?["humanDescription"]?["human"];
         if (human?.Seq == null)
         {
@@ -505,6 +506,29 @@ public static class VrchatAvatarParser
         avatar.FbxImportScale = globalScale * fileScale;
         UniLog.Log($"FBX import scale: {avatar.FbxImportScale:G6} " +
                    $"(globalScale={globalScale:G6}, fileUnits={(useFileUnits ? fileScale.ToString("G6") : "off")})");
+    }
+
+    private static void ParseFbxMaterialMappings(YamlNode meta, VrchatAvatar avatar)
+    {
+        YamlNode externalObjects = meta?["ModelImporter"]?["externalObjects"];
+        if (externalObjects?.Seq == null)
+        {
+            return;
+        }
+        foreach (YamlNode entry in externalObjects.Seq)
+        {
+            string type = entry?["first"]?["type"]?.AsString();
+            string name = entry?["first"]?["name"]?.AsString();
+            string guid = entry?["second"]?.Guid;
+            if (type == "UnityEngine:Material" && !string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(guid))
+            {
+                avatar.FbxMaterialGuids[name] = guid;
+            }
+        }
+        if (avatar.FbxMaterialGuids.Count > 0)
+        {
+            UniLog.Log($"FBX external material mappings: {avatar.FbxMaterialGuids.Count}");
+        }
     }
 
     // ---------------------------------------------------------------- descriptor (viseme/blink/view)

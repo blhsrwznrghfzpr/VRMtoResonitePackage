@@ -42,6 +42,12 @@ public sealed class VrchatAvatar
     /// <summary>Per-renderer material assignment (GameObject name -> ordered liltoon .mat guids).</summary>
     public List<VrchatRendererMaterials> RendererMaterials { get; } = new();
 
+    /// <summary>
+    /// FBX embedded material name -> external Unity .mat guid, from ModelImporter.externalObjects.
+    /// Used when a prefab variant keeps the FBX renderer hierarchy as stripped objects.
+    /// </summary>
+    public Dictionary<string, string> FbxMaterialGuids { get; } = new(StringComparer.Ordinal);
+
     /// <summary>GameObject names that start inactive in the prefab (m_IsActive = 0), e.g. costume swaps.</summary>
     public List<string> InactiveGameObjectNames { get; } = new();
 
