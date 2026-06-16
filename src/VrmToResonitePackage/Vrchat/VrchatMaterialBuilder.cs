@@ -28,6 +28,7 @@ internal static class VrchatMaterialBuilder
         IEnumerable<string> uniqueGuids = avatar.RendererMaterials
             .SelectMany(r => r.MaterialGuids)
             .Concat(avatar.FbxMaterialGuids.Values)
+            .Concat(avatar.AdditionalFbxs.SelectMany(f => f.MaterialGuids.Values))
             .Where(g => !string.IsNullOrEmpty(g))
             .Distinct(StringComparer.OrdinalIgnoreCase);
         foreach (string guid in uniqueGuids)
@@ -46,12 +47,13 @@ internal static class VrchatMaterialBuilder
         int assigned = 0;
         foreach (MeshRenderer renderer in root.GetComponentsInChildren<MeshRenderer>())
         {
+            Dictionary<string, string> fbxMaterialGuids = FbxMaterialGuidsForRenderer(root, renderer, avatar);
             for (int i = 0; i < renderer.Materials.Count; i++)
             {
                 IAssetProvider<FrooxEngine.Material> placeholder = renderer.Materials[i];
                 string name = MaterialName(placeholder?.Slot?.Name);
                 if (name != null &&
-                    avatar.FbxMaterialGuids.TryGetValue(name, out string guid) &&
+                    fbxMaterialGuids.TryGetValue(name, out string guid) &&
                     materialCache.TryGetValue(guid, out XiexeToonMaterial material))
                 {
                     renderer.Materials[i] = material;
@@ -127,6 +129,28 @@ internal static class VrchatMaterialBuilder
         return slotName?.StartsWith(prefix, StringComparison.Ordinal) == true
             ? slotName[prefix.Length..]
             : slotName;
+    }
+
+    private static Dictionary<string, string> FbxMaterialGuidsForRenderer(Slot root, MeshRenderer renderer,
+        VrchatAvatar avatar)
+    {
+        VrchatFbxAsset additional = AdditionalFbxForSlot(root, renderer.Slot, avatar);
+        return additional?.MaterialGuids ?? avatar.FbxMaterialGuids;
+    }
+
+    private static VrchatFbxAsset AdditionalFbxForSlot(Slot root, Slot slot, VrchatAvatar avatar)
+    {
+        for (Slot current = slot; current != null && current != root; current = current.Parent)
+        {
+            foreach (VrchatFbxAsset additional in avatar.AdditionalFbxs)
+            {
+                if (string.Equals(current.Name, additional.InstanceName, StringComparison.Ordinal))
+                {
+                    return additional;
+                }
+            }
+        }
+        return null;
     }
 
     private static async Task<XiexeToonMaterial> BuildMaterial(Slot assetsSlot, string guid,
