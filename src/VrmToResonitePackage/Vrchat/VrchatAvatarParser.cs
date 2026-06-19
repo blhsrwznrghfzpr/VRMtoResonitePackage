@@ -907,7 +907,9 @@ public static class VrchatAvatarParser
             TransformNodeName = placement?.TransformNodeName,
             LocalPosition = placement?.LocalPosition ?? default,
             LocalRotation = placement?.LocalRotation ?? Quat.Identity,
-            LocalScale = placement?.LocalScale ?? Vec3.One,
+            LocalScale = NormalizeImportedModelRootScale(
+                fbx, meta, placement?.TransformNodeName, placement?.ParentFbxGuid,
+                placement?.LocalScale ?? Vec3.One),
         };
         ParseFbxMaterialMappings(meta, additional.MaterialGuids);
         avatar.AdditionalFbxs.Add(additional);
@@ -933,6 +935,8 @@ public static class VrchatAvatarParser
         bool useFileUnits = meshes?["useFileUnits"]?.AsBool(
             meshes?["useFileScale"]?.AsBool(true) ?? true) ?? true;
         float fileScale = useFileUnits ? FbxUnits.MetersPerUnit(fbx.DiskPath) : 1f;
+        avatar.FbxLocalScale = NormalizeImportedModelRootScale(
+            fbx, meta, avatar.FbxTransformNodeName, avatar.FbxParentFbxGuid, avatar.FbxLocalScale);
         avatar.FbxUpAxis = FbxUnits.UpAxisDescription(fbx.DiskPath);
         UniLog.Log($"FBX import scale: {avatar.FbxImportScale:G6} " +
                    $"(globalScale={globalScale:G6}, fileUnits={(useFileUnits ? fileScale.ToString("G6") : "off")})");
@@ -947,6 +951,35 @@ public static class VrchatAvatarParser
             meshes?["useFileScale"]?.AsBool(true) ?? true) ?? true;
         float fileScale = useFileUnits ? FbxUnits.MetersPerUnit(fbx.DiskPath) : 1f;
         return globalScale * fileScale;
+    }
+
+    private static Vec3 NormalizeImportedModelRootScale(UnityAsset fbx, YamlNode meta,
+        string transformNodeName, string parentFbxGuid, Vec3 scale)
+    {
+        // Some meter-unit FBXs (Kipfel is the reference case) serialize Unity's generated model
+        // root at 0.01 scale. Assimp has already applied the FBX unit metadata and our import Scale
+        // reproduces ModelImporter's unit conversion, so applying that generated root scale again
+        // makes the avatar 100x too small. Only normalize a top-level wrapper with the exact
+        // uniform 0.01 signature; nested/authored transforms remain untouched.
+        if (!string.IsNullOrEmpty(transformNodeName) || !string.IsNullOrEmpty(parentFbxGuid) ||
+            MathF.Abs(scale.X - 0.01f) > 1e-5f ||
+            MathF.Abs(scale.Y - 0.01f) > 1e-5f ||
+            MathF.Abs(scale.Z - 0.01f) > 1e-5f)
+        {
+            return scale;
+        }
+
+        YamlNode meshes = meta?["ModelImporter"]?["meshes"];
+        bool useFileUnits = meshes?["useFileUnits"]?.AsBool(
+            meshes?["useFileScale"]?.AsBool(true) ?? true) ?? true;
+        float metersPerUnit = useFileUnits ? FbxUnits.MetersPerUnit(fbx.DiskPath) : 1f;
+        if (MathF.Abs(metersPerUnit - 1f) > 1e-4f)
+        {
+            return scale;
+        }
+
+        UniLog.Log($"Unity-generated 0.01 model root scaleを正規化します: {Path.GetFileName(fbx.LogicalPath)}");
+        return Vec3.One;
     }
 
     private static void ParseFbxMaterialMappings(YamlNode meta, Dictionary<string, string> materialGuids)

@@ -39,6 +39,8 @@ internal static class VrchatDump
             Console.WriteLine($"FBX root: {avatar.FbxInstanceName ?? "(default)"} " +
                               $"parent {avatar.FbxParentNodeName ?? "(root)"}, " +
                               $"transform {avatar.FbxTransformNodeName ?? "(wrapper)"}");
+            Console.WriteLine($"FBX placement: pos={avatar.FbxLocalPosition}, rot={avatar.FbxLocalRotation}, " +
+                              $"scale={avatar.FbxLocalScale}");
             foreach (VrchatFbxAsset additional in avatar.AdditionalFbxs)
             {
                 Console.WriteLine($"FBX +  : {additional.InstanceName} (guid {additional.Guid}, scale {additional.ImportScale:G6}, " +
