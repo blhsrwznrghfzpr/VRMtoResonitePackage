@@ -1256,9 +1256,11 @@ public static class VrchatAvatarParser
         var modelResolvers = new Dictionary<string, UnityModelFileIdResolver>(
             StringComparer.OrdinalIgnoreCase);
         var prefabScenes = new Dictionary<string, UnityScene>(StringComparer.OrdinalIgnoreCase);
+        var materialNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         int materialAssignments = 0;
         foreach (YamlNode modifications in modificationBlocks)
         {
+            var unresolvedMaterials = new List<(int Index, string Guid)>();
             foreach (YamlNode modification in modifications.Seq)
             {
                 string propertyPath = modification?["propertyPath"]?.AsString();
@@ -1281,6 +1283,14 @@ public static class VrchatAvatarParser
                     package, target?.Guid, target?.FileID ?? 0, modelResolvers, prefabScenes);
                 if (string.IsNullOrEmpty(rendererName))
                 {
+                    if (isMaterial)
+                    {
+                        string materialGuid = modification["objectReference"]?.Guid;
+                        if (!string.IsNullOrEmpty(materialGuid))
+                        {
+                            unresolvedMaterials.Add((index, materialGuid));
+                        }
+                    }
                     continue;
                 }
 
@@ -1315,6 +1325,8 @@ public static class VrchatAvatarParser
                     }
                 }
             }
+            materialAssignments += ApplyVariantMaterialFamilyFallback(
+                package, renderers, unresolvedMaterials, materialNames);
         }
 
         avatar.RendererMaterials.AddRange(renderers.Values);
@@ -1324,6 +1336,89 @@ public static class VrchatAvatarParser
             UniLog.Log($"Prefab Variant renderer overrides: {materialAssignments} material assignment(s), " +
                        $"{blendShapeRenderers} renderer(s) with initial blendshape weights.");
         }
+    }
+
+    private static int ApplyVariantMaterialFamilyFallback(UnityPackage package,
+        Dictionary<string, VrchatRendererMaterials> renderers,
+        List<(int Index, string Guid)> unresolved,
+        Dictionary<string, string> materialNames)
+    {
+        int assigned = 0;
+        foreach (IGrouping<(int Index, string Guid), (int Index, string Guid)> group in
+                 unresolved.GroupBy(item => item))
+        {
+            string replacementName = GetMaterialName(package, group.Key.Guid, materialNames);
+            string baseName = BaseVariantMaterialName(replacementName);
+            if (baseName == null)
+            {
+                continue;
+            }
+
+            List<VrchatRendererMaterials> candidates = renderers.Values
+                .Where(renderer => renderer.MaterialGuids.Count > group.Key.Index)
+                .Where(renderer => string.Equals(
+                    GetMaterialName(package, renderer.MaterialGuids[group.Key.Index], materialNames),
+                    baseName, StringComparison.Ordinal))
+                .ToList();
+            if (candidates.Count != group.Count())
+            {
+                continue;
+            }
+            foreach (VrchatRendererMaterials renderer in candidates)
+            {
+                renderer.MaterialGuids[group.Key.Index] = group.Key.Guid;
+                assigned++;
+            }
+            UniLog.Log($"Nested prefab material family fallback: {baseName} -> {replacementName} " +
+                       $"for {candidates.Count} renderer(s).");
+        }
+        return assigned;
+    }
+
+    private static string GetMaterialName(UnityPackage package, string guid,
+        Dictionary<string, string> cache)
+    {
+        if (string.IsNullOrEmpty(guid))
+        {
+            return null;
+        }
+        if (cache.TryGetValue(guid, out string cached))
+        {
+            return cached;
+        }
+        UnityAsset asset = package.ByGuid(guid);
+        string text = package.ReadText(asset);
+        string name = null;
+        if (text != null)
+        {
+            try
+            {
+                name = UnityYaml.ParseDocuments(text)
+                    .FirstOrDefault(document => document.TypeName == "Material")
+                    ?.Root?["m_Name"]?.AsString();
+            }
+            catch
+            {
+                // Malformed/non-YAML references cannot participate in the family fallback.
+            }
+        }
+        cache[guid] = name;
+        return name;
+    }
+
+    private static string BaseVariantMaterialName(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            return null;
+        }
+        string[] parts = name.Split('_');
+        if (parts.Length < 3 || parts[1].Length != 1 ||
+            !char.IsLetterOrDigit(parts[1][0]))
+        {
+            return null;
+        }
+        return string.Join("_", parts.Take(1).Concat(parts.Skip(2)));
     }
 
     private static string ResolveVariantRendererName(UnityPackage package, string guid, long fileId,
