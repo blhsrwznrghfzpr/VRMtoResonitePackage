@@ -171,11 +171,18 @@ public sealed class UnityModelFileIdResolver
             var parts = new List<string> { "//RootNode" };
             parts.AddRange(rawPath.Skip(skip));
             string nodePath = string.Join("/", parts);
-            foreach (string objectPath in new[]
+            string[] objectPaths = type == "GameObject"
+                ? new[]
+                {
+                    nodePath,
+                    nodePath.Replace("//RootNode/", "//RootNode/root/"),
+                }
+                : new[]
                      {
                          $"{nodePath}/{type}",
                          $"{nodePath.Replace("//RootNode/", "//RootNode/root/")}/{type}",
-                     })
+                     };
+            foreach (string objectPath in objectPaths)
             {
                 AddHashCandidate(type, objectPath, "0", name, Encoding.UTF8);
             }

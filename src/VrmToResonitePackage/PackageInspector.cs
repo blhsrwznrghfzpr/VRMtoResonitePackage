@@ -53,7 +53,8 @@ internal static class PackageInspector
             if (verbose || depth <= 2)
             {
                 string transform = verbose
-                    ? $" pos={FormatVec(ExtractFloats(slot.TryGetNode("Position")))}" +
+                    ? $" active={ExtractField<bool>(slot.TryGetNode("Active"))}" +
+                      $" pos={FormatVec(ExtractFloats(slot.TryGetNode("Position")))}" +
                       $" rot={FormatVec(ExtractFloats(slot.TryGetNode("Rotation")))}" +
                       $" scale={FormatVec(ExtractFloats(slot.TryGetNode("Scale")))}"
                     : "";

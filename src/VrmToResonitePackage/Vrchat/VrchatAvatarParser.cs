@@ -1258,12 +1258,36 @@ public static class VrchatAvatarParser
         var prefabScenes = new Dictionary<string, UnityScene>(StringComparer.OrdinalIgnoreCase);
         var materialNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         int materialAssignments = 0;
+        int activeAssignments = 0;
         foreach (YamlNode modifications in modificationBlocks)
         {
             var unresolvedMaterials = new List<(int Index, string Guid)>();
             foreach (YamlNode modification in modifications.Seq)
             {
                 string propertyPath = modification?["propertyPath"]?.AsString();
+                if (string.Equals(propertyPath, "m_IsActive", StringComparison.Ordinal))
+                {
+                    YamlNode activeTarget = modification["target"];
+                    string gameObjectName = ResolveVariantRendererName(
+                        package, activeTarget?.Guid, activeTarget?.FileID ?? 0,
+                        modelResolvers, prefabScenes);
+                    if (!string.IsNullOrEmpty(gameObjectName))
+                    {
+                        if (modification["value"]?.AsBool(true) == false)
+                        {
+                            if (!avatar.InactiveGameObjectNames.Contains(gameObjectName))
+                            {
+                                avatar.InactiveGameObjectNames.Add(gameObjectName);
+                            }
+                        }
+                        else
+                        {
+                            avatar.InactiveGameObjectNames.Remove(gameObjectName);
+                        }
+                        activeAssignments++;
+                    }
+                    continue;
+                }
                 var blendShapeMatch = propertyPath != null ? BlendShapeWeightPath.Match(propertyPath) : null;
                 var materialMatch = propertyPath != null ? MaterialSlotPath.Match(propertyPath) : null;
                 bool isBlendShape = blendShapeMatch?.Success == true;
@@ -1334,7 +1358,8 @@ public static class VrchatAvatarParser
         {
             int blendShapeRenderers = renderers.Values.Count(r => r.InitialBlendShapes.Count > 0);
             UniLog.Log($"Prefab Variant renderer overrides: {materialAssignments} material assignment(s), " +
-                       $"{blendShapeRenderers} renderer(s) with initial blendshape weights.");
+                       $"{blendShapeRenderers} renderer(s) with initial blendshape weights, " +
+                       $"{activeAssignments} active-state assignment(s).");
         }
     }
 

@@ -81,6 +81,9 @@ internal static class VrchatDump
             }
 
             Console.WriteLine();
+            Console.WriteLine($"非アクティブ ({avatar.InactiveGameObjectNames.Count}): " +
+                              string.Join(", ", avatar.InactiveGameObjectNames.OrderBy(name => name)));
+            Console.WriteLine();
             Console.WriteLine($"マテリアル割当 ({avatar.RendererMaterials.Count} renderer):");
             foreach (VrchatRendererMaterials rm in avatar.RendererMaterials)
             {
