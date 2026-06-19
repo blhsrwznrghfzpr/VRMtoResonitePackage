@@ -87,7 +87,9 @@ internal static class VrchatDump
                     UnityAsset a = package.ByGuid(g);
                     return a != null ? Path.GetFileNameWithoutExtension(a.LogicalPath) : (g ?? "(none)");
                 }));
-                Console.WriteLine($"  {rm.RendererGameObjectName}: [{mats}]");
+                string weights = string.Join(", ", rm.InitialBlendShapes.Select(x => $"{x.Index}={x.Weight:G6}"));
+                Console.WriteLine($"  {rm.RendererGameObjectName}: [{mats}]" +
+                                  (weights.Length > 0 ? $" blendshapes [{weights}]" : ""));
             }
             return 0;
         }

@@ -13,6 +13,10 @@ namespace VrmToResonitePackage.Vrchat;
 /// </summary>
 public static class VrchatAvatarParser
 {
+    private static readonly System.Text.RegularExpressions.Regex BlendShapeWeightPath =
+        new(@"^m_BlendShapeWeights\.Array\.data\[(\d+)\]$",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
     private sealed class Candidate
     {
         public UnityAsset Source;        // the .prefab or .unity file the avatar was found in
@@ -112,7 +116,8 @@ public static class VrchatAvatarParser
                 selected.FbxPlacements?.TryGetValue(guid, out placement);
                 AddAdditionalFbx(package, avatar, guid, placement);
             }
-            ParseDescriptor(selected.Scene, selected.Descriptor, avatar);
+            ParseDescriptor(package, selected.Scene, selected.Descriptor, avatar);
+            ParseVariantBlendShapeWeights(package, selected.Scene, selected.Descriptor, avatar);
             return avatar;
         }
 
@@ -128,7 +133,7 @@ public static class VrchatAvatarParser
 
         ResolveFbx(package, selected.Scene, selected.Subtree, avatar);
         ParseHumanoid(package, avatar);
-        ParseDescriptor(selected.Scene, selected.Descriptor, avatar);
+        ParseDescriptor(package, selected.Scene, selected.Descriptor, avatar);
         ParsePhysBones(selected.Scene, selected.Subtree, avatar);
         ParseRendererMaterials(selected.Scene, selected.Subtree, avatar);
         ParseInactiveGameObjects(selected.Scene, selected.Subtree, avatar);
@@ -944,9 +949,11 @@ public static class VrchatAvatarParser
 
     // ---------------------------------------------------------------- descriptor (viseme/blink/view)
 
-    private static void ParseDescriptor(UnityScene scene, YamlDocument descriptor, VrchatAvatar avatar)
+    private static void ParseDescriptor(UnityPackage package, UnityScene scene, YamlDocument descriptor,
+        VrchatAvatar avatar)
     {
         YamlNode d = descriptor.Root;
+        var modelResolvers = new Dictionary<string, UnityModelFileIdResolver>(StringComparer.OrdinalIgnoreCase);
 
         YamlNode view = d?["ViewPosition"];
         if (view != null && view.IsMap)
@@ -957,10 +964,9 @@ public static class VrchatAvatarParser
         // Visemes: only when the descriptor uses VisemeBlendShape lip sync (lipSync == 3).
         int lipSync = d?["lipSync"]?.AsInt(-1) ?? -1;
         YamlNode visemeShapes = d?["VisemeBlendShapes"];
-        long visemeMeshId = d?["VisemeSkinnedMesh"]?.FileID ?? 0;
-        // May be null for a variant-of-FBX avatar (stripped mesh reference); visemes still resolve by
-        // blendshape name across the imported renderers, so a null mesh name is allowed here.
-        string visemeMesh = scene.ResolveGameObjectName(visemeMeshId);
+        // Variant descriptors often reference a local stripped renderer; follow it to the source
+        // FBX GUID/fileID so the imported renderer name is preserved.
+        string visemeMesh = ResolveReferenceGameObjectName(package, scene, d?["VisemeSkinnedMesh"], modelResolvers);
         if (lipSync == 3 && visemeShapes?.Seq != null)
         {
             foreach ((string preset, int idx) in VrchatConstants.VisemeToVrcSlot())
@@ -988,13 +994,14 @@ public static class VrchatAvatarParser
         bool eyeLook = (d?["enableEyeLook"]?.AsBool() ?? false);
         if (eyeLook && eye != null)
         {
-            avatar.LeftEyeBoneName = scene.ResolveGameObjectName(eye["leftEye"]?.FileID ?? 0);
-            avatar.RightEyeBoneName = scene.ResolveGameObjectName(eye["rightEye"]?.FileID ?? 0);
+            avatar.LeftEyeBoneName = ResolveReferenceGameObjectName(package, scene, eye["leftEye"], modelResolvers);
+            avatar.RightEyeBoneName = ResolveReferenceGameObjectName(package, scene, eye["rightEye"], modelResolvers);
 
             int eyelidType = eye["eyelidType"]?.AsInt(0) ?? 0;
             if (eyelidType == 2)
             {
-                string eyelidMesh = scene.ResolveGameObjectName(eye["eyelidsSkinnedMesh"]?.FileID ?? 0);
+                string eyelidMesh = ResolveReferenceGameObjectName(
+                    package, scene, eye["eyelidsSkinnedMesh"], modelResolvers);
                 // eyelidsBlendshapes = [Blink, LookingUp, LookingDown]. Resonite drives blink via the
                 // EyeLinearDriver only, so take element [0] (Blink) and deliberately ignore the
                 // LookingUp/LookingDown shapes (they would otherwise be mis-wired as blink).
@@ -1005,6 +1012,119 @@ public static class VrchatAvatarParser
                     avatar.Blink = new VrchatBlink { MeshGameObjectName = eyelidMesh, BlendShapeIndex = blinkIndex };
                 }
             }
+        }
+    }
+
+    private static string ResolveReferenceGameObjectName(UnityPackage package, UnityScene scene,
+        YamlNode reference, Dictionary<string, UnityModelFileIdResolver> modelResolvers)
+    {
+        long fileId = reference?.FileID ?? 0;
+        if (fileId == 0)
+        {
+            return null;
+        }
+
+        string guid = reference.Guid;
+        if (string.IsNullOrEmpty(guid))
+        {
+            YamlDocument local = scene.Doc(fileId);
+            string localName = scene.ResolveGameObjectName(fileId);
+            if (!string.IsNullOrEmpty(localName))
+            {
+                return localName;
+            }
+            YamlNode source = local?.Root?["m_CorrespondingSourceObject"];
+            guid = source?.Guid;
+            fileId = source?.FileID ?? 0;
+        }
+        if (string.IsNullOrEmpty(guid) || fileId == 0)
+        {
+            return null;
+        }
+
+        UnityAsset asset = package.ByGuid(guid);
+        if (asset?.Extension == ".fbx")
+        {
+            if (!modelResolvers.TryGetValue(guid, out UnityModelFileIdResolver resolver))
+            {
+                resolver = new UnityModelFileIdResolver(asset);
+                modelResolvers.Add(guid, resolver);
+            }
+            return resolver.ResolveName(fileId);
+        }
+        if (asset?.Extension == ".prefab")
+        {
+            string text = package.ReadText(asset);
+            if (text != null)
+            {
+                return UnityScene.Parse(text).ResolveGameObjectName(fileId);
+            }
+        }
+        return null;
+    }
+
+    private static void ParseVariantBlendShapeWeights(UnityPackage package, UnityScene scene,
+        YamlDocument descriptor, VrchatAvatar avatar)
+    {
+        YamlDocument instance = VariantPrefabInstance(scene, descriptor);
+        YamlNode modifications = instance?.Root?["m_Modification"]?["m_Modifications"];
+        if (modifications?.Seq == null)
+        {
+            return;
+        }
+
+        var resolvers = new Dictionary<string, UnityModelFileIdResolver>(StringComparer.OrdinalIgnoreCase);
+        var renderers = new Dictionary<string, VrchatRendererMaterials>(StringComparer.Ordinal);
+        foreach (YamlNode modification in modifications.Seq)
+        {
+            string propertyPath = modification?["propertyPath"]?.AsString();
+            var match = propertyPath != null ? BlendShapeWeightPath.Match(propertyPath) : null;
+            if (match?.Success != true ||
+                !int.TryParse(match.Groups[1].Value, out int index))
+            {
+                continue;
+            }
+
+            YamlNode target = modification["target"];
+            string guid = target?.Guid;
+            long fileId = target?.FileID ?? 0;
+            UnityAsset asset = package.ByGuid(guid);
+            if (asset == null || fileId == 0)
+            {
+                continue;
+            }
+            if (!resolvers.TryGetValue(guid, out UnityModelFileIdResolver resolver))
+            {
+                resolver = new UnityModelFileIdResolver(asset);
+                resolvers[guid] = resolver;
+            }
+            string rendererName = resolver.ResolveName(fileId);
+            if (string.IsNullOrEmpty(rendererName))
+            {
+                continue;
+            }
+
+            float weight = modification["value"]?.AsFloat(0f) ?? 0f;
+            if (!renderers.TryGetValue(rendererName, out VrchatRendererMaterials renderer))
+            {
+                renderer = new VrchatRendererMaterials { RendererGameObjectName = rendererName };
+                renderers.Add(rendererName, renderer);
+            }
+            int existing = renderer.InitialBlendShapes.FindIndex(x => x.Index == index);
+            if (existing >= 0)
+            {
+                renderer.InitialBlendShapes[existing] = (index, weight);
+            }
+            else if (MathF.Abs(weight) > 0.001f)
+            {
+                renderer.InitialBlendShapes.Add((index, weight));
+            }
+        }
+
+        avatar.RendererMaterials.AddRange(renderers.Values);
+        if (renderers.Count > 0)
+        {
+            UniLog.Log($"Prefab Variant の初期ブレンドシェイプ値を {renderers.Count} renderer から取得しました。");
         }
     }
 
