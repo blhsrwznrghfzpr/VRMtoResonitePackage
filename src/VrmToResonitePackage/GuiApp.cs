@@ -453,7 +453,15 @@ internal sealed class MainWindow : Window
         string error = await errorTask;
 
         string logPath = FindLatestLogPath(logsDirectory, startTime);
-        string[] outputFiles = GetExpectedOutputFiles(options).Where(File.Exists).ToArray();
+        string[] reportedOutputFiles = output
+            .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries)
+            .Where(line => line.StartsWith("RESOPON_OUTPUT:", StringComparison.Ordinal))
+            .Select(line => line["RESOPON_OUTPUT:".Length..].Trim())
+            .Where(File.Exists)
+            .ToArray();
+        string[] outputFiles = reportedOutputFiles.Length > 0
+            ? reportedOutputFiles
+            : GetExpectedOutputFiles(options).Where(File.Exists).ToArray();
         if (process.ExitCode != 0 && string.IsNullOrWhiteSpace(logPath))
         {
             logPath = WriteGuiProcessFailureLog(logsDirectory, output, error);
@@ -573,9 +581,14 @@ internal sealed class MainWindow : Window
             .Select(file =>
             {
                 string outputDirectory = options.OutputDirectory ?? Path.GetDirectoryName(file);
+                string outputName = string.Equals(
+                        Path.GetExtension(file), ".unitypackage", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(options.AvatarName)
+                        ? options.AvatarName
+                        : Path.GetFileNameWithoutExtension(file);
                 return Path.Combine(
                     outputDirectory,
-                    SanitizeFileName(Path.GetFileNameWithoutExtension(file)) + ".resonitepackage");
+                    SanitizeFileName(outputName) + ".resonitepackage");
             })
             .ToArray();
     }

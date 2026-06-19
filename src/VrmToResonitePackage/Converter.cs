@@ -93,6 +93,7 @@ internal static class Converter
                         ? await ConvertVrchat(world, inputFile, options).ConfigureAwait(false)
                         : await ConvertOne(world, inputFile, options).ConfigureAwait(false);
                     outputs.Add(output);
+                    Console.WriteLine($"RESOPON_OUTPUT:{output}");
                     Console.WriteLine($"=== 完了: {output} ===");
                 }
                 catch (Exception ex)
@@ -313,8 +314,13 @@ internal static class Converter
 
         string outputDirectory = options.OutputDirectory ?? Path.GetDirectoryName(packagePath);
         Directory.CreateDirectory(outputDirectory);
+        string prefabName = Path.GetFileNameWithoutExtension(avatar.PrefabPath);
+        if (string.IsNullOrWhiteSpace(prefabName))
+        {
+            prefabName = displayName;
+        }
         string outputPath = Path.Combine(outputDirectory,
-            SanitizeFileName(Path.GetFileNameWithoutExtension(packagePath)) + ".resonitepackage");
+            SanitizeFileName(prefabName) + ".resonitepackage");
 
         // The extracted FBX content file is named "asset"; Resonite's importer keys off the
         // extension, so copy it to a real .fbx path.
