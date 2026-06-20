@@ -488,6 +488,11 @@ public static class UnityYaml
             char c = s[pos];
             if (inQuote)
             {
+                if (quote == '"' && c == '\\')
+                {
+                    AppendDoubleQuotedEscape(sb, s, ref pos);
+                    continue;
+                }
                 if (c == quote) { inQuote = false; pos++; continue; }
                 sb.Append(c);
                 pos++;
@@ -509,10 +514,88 @@ public static class UnityYaml
 
     private static string Unquote(string s)
     {
-        if (s.Length >= 2 && (s[0] == '\'' || s[0] == '"') && s[^1] == s[0])
+        if (s.Length >= 2 && s[0] == '\'' && s[^1] == '\'')
         {
-            return s[1..^1];
+            return s[1..^1].Replace("''", "'", StringComparison.Ordinal);
+        }
+        if (s.Length >= 2 && s[0] == '"' && s[^1] == '"')
+        {
+            string value = s[1..^1];
+            var result = new StringBuilder(value.Length);
+            for (int pos = 0; pos < value.Length;)
+            {
+                if (value[pos] == '\\')
+                {
+                    AppendDoubleQuotedEscape(result, value, ref pos);
+                }
+                else
+                {
+                    result.Append(value[pos++]);
+                }
+            }
+            return result.ToString();
         }
         return s;
+    }
+
+    private static void AppendDoubleQuotedEscape(StringBuilder result, string text, ref int pos)
+    {
+        pos++; // consume '\'
+        if (pos >= text.Length)
+        {
+            result.Append('\\');
+            return;
+        }
+
+        char escape = text[pos++];
+        switch (escape)
+        {
+            case '0': result.Append('\0'); return;
+            case 'a': result.Append('\a'); return;
+            case 'b': result.Append('\b'); return;
+            case 't': result.Append('\t'); return;
+            case 'n': result.Append('\n'); return;
+            case 'v': result.Append('\v'); return;
+            case 'f': result.Append('\f'); return;
+            case 'r': result.Append('\r'); return;
+            case 'e': result.Append('\u001b'); return;
+            case ' ': result.Append(' '); return;
+            case '"': result.Append('"'); return;
+            case '/': result.Append('/'); return;
+            case '\\': result.Append('\\'); return;
+            case 'N': result.Append('\u0085'); return;
+            case '_': result.Append('\u00a0'); return;
+            case 'L': result.Append('\u2028'); return;
+            case 'P': result.Append('\u2029'); return;
+            case 'x':
+                AppendHexEscape(result, text, ref pos, 2, escape);
+                return;
+            case 'u':
+                AppendHexEscape(result, text, ref pos, 4, escape);
+                return;
+            case 'U':
+                AppendHexEscape(result, text, ref pos, 8, escape);
+                return;
+            default:
+                // Preserve unknown escapes instead of silently changing Unity-authored data.
+                result.Append('\\').Append(escape);
+                return;
+        }
+    }
+
+    private static void AppendHexEscape(StringBuilder result, string text, ref int pos, int digits,
+        char escape)
+    {
+        if (pos + digits <= text.Length &&
+            int.TryParse(text.AsSpan(pos, digits), NumberStyles.HexNumber,
+                CultureInfo.InvariantCulture, out int codePoint) &&
+            codePoint <= 0x10ffff && (codePoint < 0xd800 || codePoint > 0xdfff))
+        {
+            result.Append(char.ConvertFromUtf32(codePoint));
+            pos += digits;
+            return;
+        }
+
+        result.Append('\\').Append(escape);
     }
 }
