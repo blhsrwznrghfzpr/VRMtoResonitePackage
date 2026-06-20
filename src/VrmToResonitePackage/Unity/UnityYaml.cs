@@ -219,6 +219,36 @@ public static class UnityYaml
                 content += " " + rawBody[i].Trim();
             }
 
+            // Unity wraps long plain scalars such as m_ShaderKeywords onto deeper-indented
+            // continuation lines without a YAML block marker. If left as a separate token, the
+            // mapping parser stops at that deeper line and silently drops every following field.
+            int keyColon = FindKeyColon(content);
+            if (keyColon >= 0 && content[(keyColon + 1)..].Trim().Length > 0)
+            {
+                while (i + 1 < rawBody.Count)
+                {
+                    string nextRaw = rawBody[i + 1];
+                    if (string.IsNullOrWhiteSpace(nextRaw))
+                    {
+                        i++;
+                        continue;
+                    }
+                    int nextIndent = 0;
+                    while (nextIndent < nextRaw.Length && nextRaw[nextIndent] == ' ')
+                    {
+                        nextIndent++;
+                    }
+                    string nextContent = nextRaw[nextIndent..];
+                    if (nextIndent <= indent || nextContent.StartsWith("- ", StringComparison.Ordinal) ||
+                        FindKeyColon(nextContent) >= 0)
+                    {
+                        break;
+                    }
+                    i++;
+                    content += " " + nextContent;
+                }
+            }
+
             lines.Add(new Line { Indent = indent, Text = content });
         }
         return lines;

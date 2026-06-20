@@ -5,7 +5,8 @@ namespace VrmToResonitePackage.Unity;
 
 /// <summary>
 /// Resolves Unity's stable 64-bit local file IDs for objects imported from a model asset.
-/// ModelImporter fileIdsGeneration=2 hashes the object type and hierarchy path with xxHash64.
+/// ModelImporter fileIdsGeneration=1 hashes the object type and object name, while generation 2
+/// hashes the object type and hierarchy path. Both use xxHash64.
 /// </summary>
 public sealed class UnityModelFileIdResolver
 {
@@ -14,6 +15,7 @@ public sealed class UnityModelFileIdResolver
         new(StringComparer.Ordinal);
     private readonly Dictionary<string, IReadOnlyList<float>> _blendShapeDefaultWeights =
         new(StringComparer.Ordinal);
+    private readonly List<ModelMaterial> _materials = new();
     private IReadOnlyList<UnityFbxBlendShapeDefaults.Channel> _defaultWeightChannels =
         Array.Empty<UnityFbxBlendShapeDefaults.Channel>();
     private bool[] _usedDefaultWeightChannels = Array.Empty<bool>();
@@ -38,6 +40,9 @@ public sealed class UnityModelFileIdResolver
     public IReadOnlyDictionary<string, IReadOnlyList<string>> BlendShapeNames => _blendShapeNames;
     public IReadOnlyDictionary<string, IReadOnlyList<float>> BlendShapeDefaultWeights =>
         _blendShapeDefaultWeights;
+    public IReadOnlyList<ModelMaterial> Materials => _materials;
+
+    public readonly record struct ModelMaterial(string Name, string MainTexturePath);
 
     private void AddMetaMappings(UnityAsset model)
     {
@@ -93,6 +98,13 @@ public sealed class UnityModelFileIdResolver
             if (scene?.RootNode == null)
             {
                 return;
+            }
+            foreach (Material material in scene.Materials)
+            {
+                string texturePath = material.HasTextureDiffuse
+                    ? material.TextureDiffuse.FilePath
+                    : null;
+                _materials.Add(new ModelMaterial(material.Name, texturePath));
             }
 
             var roots = new List<(Node Node, List<string> Path)>();
@@ -203,6 +215,14 @@ public sealed class UnityModelFileIdResolver
 
     private void AddPathVariants(string type, List<string> rawPath, string name)
     {
+        // Generation 1 uses only the imported object name. This is still emitted for objects whose
+        // old recycle ID cannot be reused (for example when an FBX node was renamed).
+        for (int duplicateIndex = 0; duplicateIndex < 16; duplicateIndex++)
+        {
+            AddHashCandidate(type, name, duplicateIndex.ToString(
+                System.Globalization.CultureInfo.InvariantCulture), name, Encoding.UTF8);
+        }
+
         // Assimp can expose an artificial FBX root, while Unity always starts the imported path at
         // //RootNode and may fold a single model root. Try the equivalent path forms; only a hash
         // that appears in YAML will be queried, so the extra candidates are harmless.

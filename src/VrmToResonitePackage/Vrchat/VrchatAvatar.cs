@@ -65,7 +65,8 @@ public sealed class VrchatAvatar
         new(StringComparer.Ordinal);
 
     /// <summary>
-    /// FBX embedded material name -> external Unity .mat guid, from ModelImporter.externalObjects.
+    /// FBX embedded material name -> Unity .mat guid, from ModelImporter.externalObjects or
+    /// deterministic ModelImporter material search metadata.
     /// Used when a prefab variant keeps the FBX renderer hierarchy as stripped objects.
     /// </summary>
     public Dictionary<string, string> FbxMaterialGuids { get; } = new(StringComparer.Ordinal);

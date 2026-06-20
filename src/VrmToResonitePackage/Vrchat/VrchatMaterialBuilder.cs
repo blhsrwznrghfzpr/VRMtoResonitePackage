@@ -38,12 +38,18 @@ internal static class VrchatMaterialBuilder
             {
                 materialCache[guid] = material;
             }
+            else
+            {
+                UnityAsset asset = package.ByGuid(guid);
+                UniLog.Warning($"Could not convert referenced Unity material: " +
+                               $"{asset?.LogicalPath ?? guid} (guid {guid}).");
+            }
         }
 
         // FBX prefab variants keep their renderer hierarchy as stripped objects, so the prefab
-        // doesn't contain normal SkinnedMeshRenderer documents to read. ModelImporter.externalObjects
-        // still maps every embedded FBX material name to its external .mat; replace the imported
-        // placeholder materials by that name before applying any per-renderer prefab overrides.
+        // doesn't contain normal SkinnedMeshRenderer documents to read. ModelImporter mappings
+        // associate embedded FBX material names with Unity .mat assets; replace the imported
+        // placeholder materials by that mapping before applying per-renderer prefab overrides.
         int assigned = 0;
         foreach (MeshRenderer renderer in root.GetComponentsInChildren<MeshRenderer>())
         {
